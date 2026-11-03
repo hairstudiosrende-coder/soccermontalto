@@ -195,10 +195,39 @@ def ripara_chiave(pk: str) -> str:
             + "\n-----END PRIVATE KEY-----\n")
 
 
+def credenziali():
+    """Legge le credenziali: o il JSON intero (gcp_json) o il blocco [gcp_service_account]."""
+    import json
+    if "gcp_json" in st.secrets:
+        creds = json.loads(str(st.secrets["gcp_json"]), strict=False)
+    else:
+        creds = dict(st.secrets["gcp_service_account"])
+    creds["private_key"] = ripara_chiave(creds.get("private_key", ""))
+    return creds
+
+
+def diagnosi_chiave():
+    """Informazioni sulla chiave senza mostrarla."""
+    try:
+        import base64
+        pk = credenziali()["private_key"]
+        corpo = "".join(pk.splitlines()[1:-1])
+        righe = [f"Caratteri della chiave: **{len(corpo)}** (una chiave completa ne ha circa 1.620–1.630)",
+                 f"Inizia con: `{corpo[:3]}…`  (deve iniziare con `MII`)",
+                 f"Finisce con: `…{corpo[-3:]}`"]
+        try:
+            base64.b64decode(corpo, validate=True)
+            righe.append("Formato base64: ✅ corretto")
+        except Exception:
+            righe.append("Formato base64: ❌ la chiave è tagliata o contiene caratteri in più")
+        return "\n\n".join(righe)
+    except Exception as e:
+        return f"Impossibile leggere i Secrets: {e}"
+
+
 @st.cache_resource(show_spinner=False)
 def book():
-    creds = dict(st.secrets["gcp_service_account"])
-    creds["private_key"] = ripara_chiave(creds.get("private_key", ""))
+    creds = credenziali()
     gc = gspread.service_account_from_dict(creds)
     sid = st.secrets.get("SHEET_ID", "")
     if sid.startswith("http"):
@@ -1563,6 +1592,9 @@ def main():
         applica_stile()
         st.error("Non riesco a collegarmi al Google Sheet. Controlla i *Secrets* "
                  "(gcp_service_account e SHEET_ID) e che il foglio sia condiviso con l'email del service account.")
+        if "PEM" in str(e) or "private" in str(e).lower():
+            st.warning("Il problema è la **private_key** nei Secrets. Diagnosi:")
+            st.markdown(diagnosi_chiave())
         st.exception(e)
         st.stop()
 
