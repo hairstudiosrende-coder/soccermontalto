@@ -225,45 +225,65 @@ def diagnosi_chiave():
         return f"Impossibile leggere i Secrets: {e}"
 
 
+def sheet_id():
+    for k in ("SHEET_ID", "sheet_id", "gsheet_id", "GSHEET_ID"):
+        if k in st.secrets:
+            return str(st.secrets[k]).strip()
+    return ""
+
+
 @st.cache_resource(show_spinner=False)
 def book():
-    creds = credenziali()
-    gc = gspread.service_account_from_dict(creds)
-    sid = st.secrets.get("SHEET_ID", "")
+    gc = gspread.service_account_from_dict(credenziali())
+    sid = sheet_id()
     if sid.startswith("http"):
         return gc.open_by_url(sid)
     return gc.open_by_key(sid)
 
 
 @st.cache_resource(show_spinner="Preparo il foglio Google…")
-def worksheets():
-    """Crea i fogli mancanti e le colonne mancanti. Restituisce {nome: worksheet}."""
+def struttura():
+    """Controlla TUTTI i fogli con 2 sole richieste e crea solo ciò che manca.
+    Restituisce (worksheets, intestazioni)."""
     sh = book()
     esistenti = {ws.title: ws for ws in sh.worksheets()}
+    presenti = [n for n in SHEETS if n in esistenti]
+    intest = {}
+    if presenti:
+        res = sh.values_batch_get(ranges=[f"'{n}'!1:1" for n in presenti])
+        for n, vr in zip(presenti, res.get("valueRanges", [])):
+            v = vr.get("values", [])
+            intest[n] = [str(h).strip() for h in v[0]] if v else []
     for nome, cols in SHEETS.items():
         if nome not in esistenti:
             ws = sh.add_worksheet(title=nome, rows=200, cols=max(len(cols), 8))
             ws.update(range_name="A1", values=[cols], value_input_option="RAW")
-            esistenti[nome] = ws
-        else:
+            esistenti[nome], intest[nome] = ws, list(cols)
+            continue
+        header = intest.get(nome, [])
+        mancanti = [c for c in cols if c not in header]
+        if mancanti:
+            nuovo = header + mancanti
             ws = esistenti[nome]
-            header = [h.strip() for h in ws.row_values(1)]
-            if not header:
-                ws.update(range_name="A1", values=[cols], value_input_option="RAW")
-            else:
-                mancanti = [c for c in cols if c not in header]
-                if mancanti:
-                    nuovo = header + mancanti
-                    if ws.col_count < len(nuovo):
-                        ws.add_cols(len(nuovo) - ws.col_count)
-                    ws.update(range_name="A1", values=[nuovo], value_input_option="RAW")
-    return esistenti
+            if ws.col_count < len(nuovo):
+                ws.add_cols(len(nuovo) - ws.col_count)
+            ws.update(range_name="A1", values=[nuovo], value_input_option="RAW")
+            intest[nome] = nuovo
+    return esistenti, intest
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+def worksheets():
+    return struttura()[0]
+
+
+def intestazione(nome):
+    return struttura()[1][nome]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def leggi_tutto():
     """Una sola chiamata a Google per leggere tutti i fogli."""
-    worksheets()
+    struttura()
     nomi = list(SHEETS.keys())
     res = book().values_batch_get(
         ranges=[f"'{n}'" for n in nomi],
@@ -280,19 +300,19 @@ def leggi_tutto():
         w = len(header)
         righe = [(list(r) + [""] * w)[:w] for r in vals[1:]
                  if any(str(c).strip() for c in r)]
-        df = pd.DataFrame(righe, columns=header)
+        tab = pd.DataFrame(righe, columns=header)
         for c in cols:
-            if c not in df.columns:
-                df[c] = ""
-        df = df[cols].copy()
+            if c not in tab.columns:
+                tab[c] = ""
+        tab = tab[cols].copy()
         for c in cols:
             if c in NUM_COLS:
-                df[c] = df[c].apply(to_num)
+                tab[c] = tab[c].apply(to_num).astype(float)
             else:
-                df[c] = df[c].apply(lambda x: "" if x is None else
-                                    (str(int(x)) if isinstance(x, float) and x.is_integer()
-                                     else str(x)).strip())
-        out[nome] = df
+                tab[c] = tab[c].apply(lambda x: "" if x is None else
+                                      (str(int(x)) if isinstance(x, float) and x.is_integer()
+                                       else str(x)).strip()).astype(object)
+        out[nome] = tab
     return out
 
 
@@ -301,64 +321,70 @@ def df(nome):
 
 
 def _riga_valori(nome, rec):
-    header = [h.strip() for h in worksheets()[nome].row_values(1)]
-    return [rec.get(c, "") if rec.get(c, "") is not None else "" for c in header]
+    return [("" if rec.get(c) is None else rec.get(c, "")) for c in intestazione(nome)]
+
+
+def _log_riga(azione, foglio, dettaglio):
+    return [adesso(), (st.session_state.get("utente") or {}).get("username", "-"),
+            azione, foglio, str(dettaglio)[:300]]
 
 
 def aggiungi(nome, rec, log=True):
-    ws = worksheets()[nome]
-    ws.append_row(_riga_valori(nome, rec), value_input_option="RAW",
-                  insert_data_option="INSERT_ROWS", table_range="A1")
+    worksheets()[nome].append_row(_riga_valori(nome, rec), value_input_option="RAW",
+                                  insert_data_option="INSERT_ROWS", table_range="A1")
     if log:
         scrivi_log("Aggiunto", nome, rec.get("id") or rec.get("nome") or rec.get("chiave", ""))
     leggi_tutto.clear()
 
 
-def _trova_riga(nome, chiave_col, valore):
+def aggiungi_molti(nome, recs):
+    if recs:
+        worksheets()[nome].append_rows([_riga_valori(nome, r) for r in recs],
+                                       value_input_option="RAW",
+                                       insert_data_option="INSERT_ROWS", table_range="A1")
+        leggi_tutto.clear()
+
+
+def _trova_riga(nome, chiave_col, valore, extra=None):
+    """Una sola richiesta: legge solo la colonna chiave (o tutto se servono più colonne)."""
     ws = worksheets()[nome]
-    header = [h.strip() for h in ws.row_values(1)]
-    idx = header.index(chiave_col) + 1
-    colonna = ws.col_values(idx)
+    header = intestazione(nome)
+    if extra:
+        righe = ws.get_all_values()
+        for i, riga in enumerate(righe[1:], start=2):
+            riga = (riga + [""] * len(header))[:len(header)]
+            if riga[header.index(chiave_col)].strip() == str(valore).strip() and all(
+                    riga[header.index(k)].strip() == str(v).strip() for k, v in extra.items()):
+                return i
+        return None
+    colonna = ws.col_values(header.index(chiave_col) + 1)
     for i, v in enumerate(colonna[1:], start=2):
         if str(v).strip() == str(valore).strip():
-            return i, header
-    return None, header
+            return i
+    return None
 
 
 def aggiorna(nome, valore, campi: dict, chiave_col="id"):
-    ws = worksheets()[nome]
-    r, header = _trova_riga(nome, chiave_col, valore)
+    """Aggiorna solo le celle cambiate: 1 lettura + 1 scrittura."""
+    r = _trova_riga(nome, chiave_col, valore)
     if r is None:
         return False
-    attuale = ws.row_values(r)
-    attuale = (attuale + [""] * len(header))[:len(header)]
-    for k, v in campi.items():
-        if k in header:
-            attuale[header.index(k)] = v
-    ws.update(range_name=f"A{r}", values=[attuale], value_input_option="RAW")
+    header = intestazione(nome)
+    blocchi = [{"range": gspread.utils.rowcol_to_a1(r, header.index(k) + 1),
+                "values": [["" if v is None else v]]}
+               for k, v in campi.items() if k in header]
+    if blocchi:
+        worksheets()[nome].batch_update(blocchi, value_input_option="RAW")
     scrivi_log("Modificato", nome, f"{valore}: {', '.join(campi.keys())}")
     leggi_tutto.clear()
     return True
 
 
 def elimina(nome, valore, chiave_col="id", extra=None):
-    ws = worksheets()[nome]
-    r, _ = _trova_riga(nome, chiave_col, valore)
+    r = _trova_riga(nome, chiave_col, valore, extra)
     if r is None:
         return False
-    if extra is not None:  # per fogli con chiave non univoca (Categorie)
-        righe = ws.get_all_values()
-        header = [h.strip() for h in righe[0]]
-        r = None
-        for i, riga in enumerate(righe[1:], start=2):
-            riga = (riga + [""] * len(header))[:len(header)]
-            if riga[header.index(chiave_col)] == valore and all(
-                    riga[header.index(k)] == v for k, v in extra.items()):
-                r = i
-                break
-        if r is None:
-            return False
-    ws.delete_rows(r)
+    worksheets()[nome].delete_rows(r)
     scrivi_log("Eliminato", nome, str(valore))
     leggi_tutto.clear()
     return True
@@ -366,11 +392,16 @@ def elimina(nome, valore, chiave_col="id", extra=None):
 
 def scrivi_log(azione, foglio, dettaglio):
     try:
-        worksheets()["Log"].append_row(
-            [adesso(), st.session_state.get("utente", {}).get("username", "-"),
-             azione, foglio, str(dettaglio)[:300]], value_input_option="RAW")
+        worksheets()["Log"].append_row(_log_riga(azione, foglio, dettaglio),
+                                       value_input_option="RAW",
+                                       insert_data_option="INSERT_ROWS", table_range="A1")
     except Exception:
         pass
+
+
+def avviso(msg):
+    """Messaggio che resta visibile anche dopo il ricaricamento della pagina."""
+    st.session_state["_avviso"] = msg
 
 
 def impostazione(chiave, default=""):
@@ -422,55 +453,127 @@ def vede_importi():
 # ════════════════════════════════════════════════════════════════════
 # GRAFICA – stile campo da calcio
 # ════════════════════════════════════════════════════════════════════
+def _chiaro(hex_col):
+    """True se il colore è chiaro (per scegliere testo scuro o chiaro sopra)."""
+    h = str(hex_col).lstrip("#")
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except (ValueError, IndexError):
+        return False
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 160
+
+
 def applica_stile(c1="#1f7a3a", c2="#ffffff"):
+    txt1 = "#0b3d2e" if _chiaro(c1) else "#ffffff"
     st.markdown(f"""
     <style>
-    :root {{ --c1:{c1}; --c2:{c2}; --oro:#d4af37; --prato:#0b3d2e; }}
+    :root {{ --c1:{c1}; --c2:{c2}; --txt1:{txt1}; --oro:#d4af37; --prato:#0b3d2e;
+             --scuro:#07291f; --chiaro:#f5f5f0; --bordo:rgba(255,255,255,.16); }}
+
+    /* ── SFONDO: strisce del prato ── */
     .stApp {{
         background:
+          radial-gradient(ellipse at top, rgba(255,255,255,.06), transparent 60%),
           repeating-linear-gradient(90deg, #0b3d2e 0 90px, #0d4434 90px 180px);
     }}
-    [data-testid="stSidebar"] > div:first-child {{
-        background: linear-gradient(180deg, #07291f 0%, #0b3d2e 100%);
-        border-right: 2px solid rgba(255,255,255,.15);
-    }}
-    h1, h2, h3 {{ letter-spacing:.3px; }}
-    .banner {{
-        position:relative; overflow:hidden; border-radius:16px; padding:22px 26px;
-        background: linear-gradient(120deg, var(--c1) 0%, #0b3d2e 75%);
-        border:2px solid rgba(255,255,255,.55); margin-bottom:18px;
-    }}
-    .banner:before {{ /* linea di metà campo */
-        content:""; position:absolute; top:0; bottom:0; left:62%;
-        border-left:2px solid rgba(255,255,255,.25);
-    }}
-    .banner:after {{ /* cerchio di centrocampo */
-        content:""; position:absolute; width:150px; height:150px; border-radius:50%;
-        border:2px solid rgba(255,255,255,.25); left:calc(62% - 75px); top:calc(50% - 75px);
-    }}
-    .banner .t {{ font-size:30px; font-weight:800; color:var(--c2); line-height:1.1; }}
-    .banner .s {{ font-size:15px; color:#f5f5f0; opacity:.9; margin-top:6px; }}
-    .banner .badge {{
-        display:inline-block; margin-top:10px; padding:3px 12px; border-radius:20px;
-        background:var(--oro); color:#0b3d2e; font-weight:700; font-size:13px;
-    }}
-    .kpi {{
-        background: rgba(7,41,31,.85); border:1px solid rgba(255,255,255,.18);
-        border-left:5px solid var(--c1); border-radius:12px; padding:14px 16px; height:100%;
-    }}
-    .kpi .l {{ font-size:12px; text-transform:uppercase; letter-spacing:.8px; opacity:.75; }}
-    .kpi .v {{ font-size:24px; font-weight:800; margin-top:4px; }}
-    .kpi .n {{ font-size:12px; opacity:.7; margin-top:2px; }}
-    .kpi.pos .v {{ color:#7CFC9A; }} .kpi.neg .v {{ color:#ff8a80; }} .kpi.gold .v {{ color:var(--oro); }}
-    .pill {{ padding:2px 10px; border-radius:12px; font-size:12px; font-weight:700; }}
-    .stTabs [data-baseweb="tab"] {{ font-weight:600; }}
-    [data-testid="stForm"] {{ background: rgba(7,41,31,.6); border-radius:12px; }}
-    .banner:before, .banner:after {{ pointer-events:none; }}
+    [data-testid="stHeader"] {{ background:transparent; }}
+    .block-container {{ padding-top:2.2rem; max-width:1300px; }}
 
-    /* ── TESTI CHIARI SULLO SFONDO VERDE ── */
+    /* ── TESTI CHIARI ── */
     .stApp, .stApp p, .stApp span, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
     .stApp h5, .stApp label, [data-testid="stWidgetLabel"] *, [data-testid="stMarkdownContainer"] *,
-    [data-testid="stCaptionContainer"], [data-testid="stSidebar"] * {{ color:#f5f5f0 !important; }}
+    [data-testid="stCaptionContainer"], [data-testid="stSidebar"] * {{ color:var(--chiaro) !important; }}
+    .stApp h4 {{ border-left:4px solid var(--oro); padding-left:10px; margin-top:18px; }}
+    .stApp h3 {{ font-weight:800; }}
+
+    /* ── BARRA LATERALE ── */
+    [data-testid="stSidebar"] > div:first-child {{
+        background: linear-gradient(180deg, var(--scuro) 0%, #0b3d2e 100%);
+        border-right: 2px solid var(--bordo);
+    }}
+    .stemma {{ display:flex; align-items:center; gap:12px; margin:4px 0 16px; }}
+    .stemma .scudo {{
+        width:54px; height:62px; flex:0 0 54px; display:flex; align-items:center; justify-content:center;
+        background:linear-gradient(90deg, var(--c1) 50%, var(--c2) 50%);
+        clip-path:polygon(50% 100%, 0 72%, 0 0, 100% 0, 100% 72%);
+        font-weight:900; font-size:18px; letter-spacing:.5px;
+        box-shadow:0 0 0 3px var(--oro) inset;
+    }}
+    .stemma .scudo span {{ color:var(--oro) !important; text-shadow:0 1px 2px #000; }}
+    .stemma .nome {{ font-weight:800; font-size:17px; line-height:1.15; }}
+    .stemma .citta {{ font-size:12px; opacity:.7; }}
+
+    /* menu: niente pallini, voci a pulsante */
+    [data-testid="stSidebar"] [role="radiogroup"] {{ gap:4px; }}
+    [data-testid="stSidebar"] [role="radiogroup"] label {{
+        width:100%; padding:9px 12px; border-radius:10px; margin:0;
+        border:1px solid transparent; transition:all .15s;
+    }}
+    [data-testid="stSidebar"] [role="radiogroup"] label:hover {{
+        background:rgba(255,255,255,.07); border-color:var(--bordo);
+    }}
+    [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {{ display:none; }}
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {{
+        background:var(--oro); border-color:var(--oro);
+    }}
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) * {{
+        color:var(--prato) !important; font-weight:800;
+    }}
+
+    /* ── TITOLO PAGINA (campo da calcio) ── */
+    .banner {{
+        position:relative; overflow:hidden; border-radius:18px; padding:24px 28px;
+        background: linear-gradient(120deg, var(--c1) 0%, #0b3d2e 70%);
+        border:2px solid rgba(255,255,255,.55); margin-bottom:20px;
+        box-shadow:0 10px 30px rgba(0,0,0,.25);
+    }}
+    .banner:before {{ content:""; position:absolute; top:0; bottom:0; left:66%;
+        border-left:2px solid rgba(255,255,255,.22); pointer-events:none; }}
+    .banner:after {{ content:""; position:absolute; width:150px; height:150px; border-radius:50%;
+        border:2px solid rgba(255,255,255,.22); left:calc(66% - 75px); top:calc(50% - 75px);
+        pointer-events:none; }}
+    .banner .t {{ font-size:30px; font-weight:900; line-height:1.1; position:relative; z-index:1; }}
+    .banner .t, .banner .t * {{ color:var(--txt1) !important; }}
+    .banner .s {{ font-size:15px; opacity:.9; margin-top:6px; position:relative; z-index:1; }}
+    .banner .badge {{
+        display:inline-block; margin-top:12px; padding:4px 14px; border-radius:20px;
+        background:var(--oro); font-weight:800; font-size:13px; position:relative; z-index:1;
+    }}
+    .banner .badge, .banner .badge * {{ color:var(--prato) !important; }}
+
+    /* ── CARD NUMERI ── */
+    .kpi {{
+        background: linear-gradient(160deg, rgba(7,41,31,.95), rgba(13,68,52,.85));
+        border:1px solid var(--bordo); border-top:4px solid var(--c1);
+        border-radius:14px; padding:14px 16px; height:100%; min-height:96px;
+        box-shadow:0 6px 18px rgba(0,0,0,.2); transition:transform .15s;
+    }}
+    .kpi:hover {{ transform:translateY(-2px); }}
+    .kpi .l {{ font-size:11.5px; text-transform:uppercase; letter-spacing:.9px; opacity:.75; }}
+    .kpi .v {{ font-size:25px; font-weight:900; margin-top:4px; white-space:nowrap; }}
+    .kpi .n {{ font-size:12px; opacity:.7; margin-top:2px; }}
+    .kpi.pos {{ border-top-color:#4caf50; }} .kpi.pos .v {{ color:#7CFC9A !important; }}
+    .kpi.neg {{ border-top-color:#e57373; }} .kpi.neg .v {{ color:#ff8a80 !important; }}
+    .kpi.gold {{ border-top-color:var(--oro); }} .kpi.gold .v {{ color:var(--oro) !important; }}
+    .pill {{ padding:2px 10px; border-radius:12px; font-size:12px; font-weight:800; }}
+    .pill, .pill * {{ color:var(--prato) !important; }}
+
+    /* ── SCHEDE, MODULI, RIQUADRI ── */
+    .stTabs [data-baseweb="tab-list"] {{ gap:6px; border-bottom:1px solid var(--bordo); }}
+    .stTabs [data-baseweb="tab"] {{
+        background:rgba(7,41,31,.6); border-radius:10px 10px 0 0; padding:8px 16px; font-weight:700;
+    }}
+    .stTabs [aria-selected="true"] {{ background:var(--oro) !important; }}
+    .stTabs [aria-selected="true"] * {{ color:var(--prato) !important; }}
+    .stTabs [data-baseweb="tab-highlight"] {{ background:var(--oro) !important; }}
+    [data-testid="stForm"] {{
+        background: rgba(7,41,31,.72); border:1px solid var(--bordo) !important; border-radius:14px;
+    }}
+    [data-testid="stExpander"] details {{
+        background: rgba(7,41,31,.6); border:1px solid var(--bordo) !important; border-radius:12px;
+    }}
+    [data-testid="stAlert"] {{ background:rgba(7,41,31,.85) !important; border-radius:12px; }}
+    [data-testid="stDataFrame"] {{ border:1px solid var(--bordo); border-radius:10px; overflow:hidden; }}
 
     /* ── CAMPI DA COMPILARE: sfondo bianco, testo scuro ── */
     .stApp input, .stApp textarea,
@@ -481,13 +584,14 @@ def applica_stile(c1="#1f7a3a", c2="#ffffff"):
         border-color:#d4af37 !important;
     }}
     .stApp [data-baseweb="select"] *, .stApp [data-testid="stNumberInput"] button *,
-    .stApp [data-baseweb="input"] *, .stApp [data-baseweb="base-input"] * {{
+    .stApp [data-baseweb="input"] *, .stApp [data-baseweb="base-input"] *,
+    .stApp [data-baseweb="tag"] * {{
         color:#0b3d2e !important; -webkit-text-fill-color:#0b3d2e !important; fill:#0b3d2e !important;
     }}
+    .stApp [data-baseweb="tag"] {{ background:#f3e7b8 !important; }}
     .stApp input::placeholder, .stApp textarea::placeholder {{
         color:#7a8a83 !important; -webkit-text-fill-color:#7a8a83 !important;
     }}
-    /* menu a tendina e calendario */
     [data-baseweb="popover"], [data-baseweb="menu"], [role="listbox"], [data-baseweb="calendar"] {{
         background:#ffffff !important;
     }}
@@ -496,17 +600,39 @@ def applica_stile(c1="#1f7a3a", c2="#ffffff"):
         color:#0b3d2e !important; -webkit-text-fill-color:#0b3d2e !important;
     }}
     [role="option"]:hover, [aria-selected="true"][role="option"] {{ background:#e8f3ec !important; }}
+    /* checkbox e radio leggibili */
+    .stApp [data-testid="stCheckbox"] label span, .stApp [data-testid="stRadio"] label span {{
+        border-color:var(--oro) !important;
+    }}
 
     /* ── PULSANTI ── */
     .stButton button, [data-testid="stFormSubmitButton"] button, [data-testid="stDownloadButton"] button {{
-        background:#d4af37 !important; border:none !important; font-weight:700 !important;
+        background:var(--oro) !important; border:none !important; font-weight:800 !important;
+        border-radius:10px !important; transition:filter .15s;
     }}
+    .stButton button:hover, [data-testid="stFormSubmitButton"] button:hover,
+    [data-testid="stDownloadButton"] button:hover {{ filter:brightness(1.1); }}
     .stApp .stButton button *, .stApp [data-testid="stFormSubmitButton"] button *,
-    .stApp [data-testid="stDownloadButton"] button * {{
-        color:#0b3d2e !important;
+    .stApp [data-testid="stDownloadButton"] button * {{ color:#0b3d2e !important; }}
+
+    /* ── TELEFONO ── */
+    @media (max-width: 640px) {{
+        .banner {{ padding:18px; }} .banner .t {{ font-size:23px; }}
+        .banner:before, .banner:after {{ display:none; }}
+        .kpi .v {{ font-size:20px; }}
     }}
     </style>
     """, unsafe_allow_html=True)
+
+
+def stemma():
+    nome = impostazione("nome_squadra", "La mia squadra")
+    parole = [p for p in nome.replace(".", " ").split() if p[:1].isalpha()]
+    sigla = "".join(p[0] for p in parole[:3]).upper() or "⚽"
+    citta = impostazione("citta", "")
+    st.markdown(f"""<div class="stemma"><div class="scudo"><span>{sigla}</span></div>
+        <div><div class="nome">{nome}</div><div class="citta">{citta}</div></div></div>""",
+                unsafe_allow_html=True)
 
 
 def banner(titolo, sottotitolo=""):
@@ -627,31 +753,33 @@ def pagina_setup():
         nome_admin = c6.text_input("Nome e cognome *")
         user = c7.text_input("Username *")
         pw = c8.text_input("Password * (min. 6 caratteri)", type="password")
-        ok = st.form_submit_button("Crea squadra", type="primary", use_container_width=True)
+        ok = st.form_submit_button("Crea squadra", type="primary", width="stretch")
     if ok:
         if not nome.strip() or not user.strip() or len(pw) < 6 or not nome_admin.strip():
             st.error("Compila tutti i campi obbligatori (password di almeno 6 caratteri).")
             return
         with st.spinner("Creo la squadra…"):
-            for k, v in {"nome_squadra": nome.strip(), "citta": citta.strip(),
-                         "colore_1": col1, "colore_2": col2, "ruolo_admin": "Presidente",
-                         "setup_completato": "SI"}.items():
-                salva_impostazione(k, v)
             stg = stagione_da_anno(a)
             if not (df("Stagioni")["stagione"] == stg).any():
-                aggiungi("Stagioni", {"stagione": stg, "data_inizio": f"{a}-07-01",
-                                      "data_fine": f"{a + 1}-06-30", "attiva": "SI"})
+                aggiungi_molti("Stagioni", [{"stagione": stg, "data_inizio": f"{a}-07-01",
+                                             "data_fine": f"{a + 1}-06-30", "attiva": "SI"}])
             if not (df("Ruoli")["ruolo"] == "Presidente").any():
-                aggiungi("Ruoli", {"ruolo": "Presidente", "pagine": ",".join(PAGINE),
-                                   "puo_modificare": "SI", "vede_importi": "SI"})
-            aggiungi("Utenti", {"username": user.strip().lower(), "password_hash": hash_pw(pw),
-                                "nome": nome_admin.strip(), "ruolo": "Presidente",
-                                "attivo": "SI"})
+                aggiungi_molti("Ruoli", [{"ruolo": "Presidente", "pagine": ",".join(PAGINE),
+                                          "puo_modificare": "SI", "vede_importi": "SI"}])
             if df("Categorie").empty:
-                righe = [[t, n] for t, lista in CATEGORIE_DEFAULT.items() for n in lista]
-                worksheets()["Categorie"].append_rows(righe, value_input_option="RAW")
-                leggi_tutto.clear()
-        st.success("Squadra creata! Ora accedi.")
+                aggiungi_molti("Categorie", [{"tipo": t, "nome": n}
+                                             for t, lista in CATEGORIE_DEFAULT.items() for n in lista])
+            aggiungi_molti("Utenti", [{"username": user.strip().lower(), "password_hash": hash_pw(pw),
+                                       "nome": nome_admin.strip(), "ruolo": "Presidente",
+                                       "attivo": "SI"}])
+            gia = set(df("Impostazioni")["chiave"])
+            imp = {"nome_squadra": nome.strip(), "citta": citta.strip(), "colore_1": col1,
+                   "colore_2": col2, "ruolo_admin": "Presidente", "setup_completato": "SI"}
+            for k in [k for k in imp if k in gia]:
+                aggiorna("Impostazioni", k, {"valore": imp.pop(k)}, chiave_col="chiave")
+            aggiungi_molti("Impostazioni", [{"chiave": k, "valore": v} for k, v in imp.items()])
+            scrivi_log("Creata squadra", "Impostazioni", nome.strip())
+        avviso("✅ Squadra creata! Ora accedi con il tuo utente.")
         st.rerun()
 
 
@@ -660,13 +788,16 @@ def pagina_login():
     nome = impostazione("nome_squadra", "La mia squadra")
     _, c, _ = st.columns([1, 1.3, 1])
     with c:
+        msg = st.session_state.pop("_avviso", None)
+        if msg:
+            st.success(msg)
         st.markdown(f"""<div class="banner" style="text-align:center"><div class="t">⚽ {nome}</div>
             <div class="s">Area riservata – gestione società</div></div>""",
                     unsafe_allow_html=True)
         with st.form("login"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
-            ok = st.form_submit_button("Entra", type="primary", use_container_width=True)
+            ok = st.form_submit_button("Entra", type="primary", width="stretch")
         if ok:
             ut = df("Utenti")
             r = ut[(ut["username"] == u.strip().lower()) & (ut["attivo"].str.upper() == "SI")]
@@ -740,7 +871,7 @@ def pagina_panoramica():
                                                           range=["#7CFC9A", "#ff8a80"]),
                                 legend=alt.Legend(orient="top", title=None)),
                 tooltip=["mese", "tipo", alt.Tooltip("importo:Q", format=",.2f")])
-            st.altair_chart(grafico_tema(ch.properties(height=300)), use_container_width=True)
+            st.altair_chart(grafico_tema(ch.properties(height=300)), width="stretch")
         else:
             st.caption("Nessun movimento ancora registrato.")
     with g2:
@@ -753,7 +884,7 @@ def pagina_panoramica():
                 y=alt.Y("categoria:N", sort="-x", title=None),
                 x=alt.X("importo:Q", title="€"),
                 tooltip=["categoria", alt.Tooltip("importo:Q", format=",.2f")])
-            st.altair_chart(grafico_tema(ch.properties(height=300)), use_container_width=True)
+            st.altair_chart(grafico_tema(ch.properties(height=300)), width="stretch")
         else:
             st.caption("Nessuna uscita ancora registrata.")
 
@@ -854,7 +985,7 @@ def pagina_rosa():
                 st.markdown(f"#### {rep}  <span style='opacity:.6;font-size:14px'>({len(g)})</span>",
                             unsafe_allow_html=True)
                 st.dataframe(g[list(cols)].rename(columns=cols), hide_index=True,
-                             use_container_width=True,
+                             width="stretch",
                              column_config={k: st.column_config.NumberColumn(format="€ %.2f")
                                             for k in ["Compenso", "Extra", "Totale", "Pagato", "Residuo"]})
             if imp:
@@ -901,7 +1032,7 @@ def pagina_rosa():
                     if not imp:
                         rec.pop("compenso_stagione")
                     aggiorna("Tesserati", sel, rec)
-                    st.success("Dati aggiornati.")
+                    avviso("Dati aggiornati.")
                     st.rerun()
                 with st.expander("🔁 Conferma per un'altra stagione"):
                     stg = [s for s in df("Stagioni")["stagione"].tolist()
@@ -943,7 +1074,7 @@ def pagina_rosa():
                 if len(v):
                     st.dataframe(v[["voce", "importo", "note"]].rename(
                         columns={"voce": "Voce", "importo": "Importo", "note": "Note"}),
-                        hide_index=True, use_container_width=True,
+                        hide_index=True, width="stretch",
                         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
                 else:
                     st.caption("Solo compenso base. Aggiungi qui alloggio, vitto, volo, procura, premi…")
@@ -979,7 +1110,7 @@ def pagina_rosa():
                     st.dataframe(p[["Data", "mese_rif", "voce", "importo", "metodo", "note"]].rename(
                         columns={"mese_rif": "Mese", "voce": "Voce", "importo": "Importo",
                                  "metodo": "Metodo", "note": "Note"}),
-                        hide_index=True, use_container_width=True,
+                        hide_index=True, width="stretch",
                         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
 
 
@@ -1034,7 +1165,7 @@ def pagina_pagamenti():
                                            "utente": st.session_state["utente"]["username"], "mov_id": mov})
                     if mov:
                         aggiorna("Movimenti", mov, {"rif_id": pid})
-                    st.success(f"✅ Pagamento di {euro(importo)} a {nomi[tid]} registrato.")
+                    avviso(f"✅ Pagamento di {euro(importo)} a {nomi[tid]} registrato.")
                     st.rerun()
 
     with tab2:
@@ -1042,7 +1173,7 @@ def pagina_pagamenti():
         st.dataframe(v.rename(columns={"nominativo": "Nominativo", "tipo": "Tipo", "reparto": "Reparto",
                                        "compenso_stagione": "Compenso", "extra": "Extra",
                                        "totale": "Totale", "pagato": "Pagato", "residuo": "Residuo"}),
-                     hide_index=True, use_container_width=True,
+                     hide_index=True, width="stretch",
                      column_config={k: st.column_config.NumberColumn(format="€ %.2f")
                                     for k in ["Compenso", "Extra", "Totale", "Pagato", "Residuo"]})
         c = st.columns(3)
@@ -1074,7 +1205,7 @@ def pagina_pagamenti():
             tot = pd.DataFrame([{"GIOCATORE": "TOTALE", "BONIFICO": pv["BONIFICO"].sum(),
                                  "CONTANTI": pv["CONTANTI"].sum(), "TOTALE": pv["TOTALE"].sum(), "IBAN": ""}])
             pv = pd.concat([pv, tot], ignore_index=True)
-            st.dataframe(pv, hide_index=True, use_container_width=True,
+            st.dataframe(pv, hide_index=True, width="stretch",
                          column_config={k: st.column_config.NumberColumn(format="€ %.2f")
                                         for k in ["BONIFICO", "CONTANTI", "TOTALE"]})
             st.download_button("⬇️ Scarica elenco pagamenti", to_excel({mese: pv}),
@@ -1092,7 +1223,7 @@ def pagina_pagamenti():
             st.dataframe(p[["Data", "Tesserato", "mese_rif", "voce", "importo", "metodo", "note", "utente"]]
                          .rename(columns={"mese_rif": "Mese", "voce": "Voce", "importo": "Importo",
                                           "metodo": "Metodo", "note": "Note", "utente": "Inserito da"}),
-                         hide_index=True, use_container_width=True,
+                         hide_index=True, width="stretch",
                          column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
             if puo_modificare():
                 with st.expander("🗑️ Elimina un pagamento"):
@@ -1142,7 +1273,7 @@ def pagina_cassa():
                         st.error("Servono descrizione e importo.")
                     else:
                         registra_movimento(tipo, dt, cat, desc.strip(), imp, met, note=note)
-                        st.success("Movimento registrato.")
+                        avviso("Movimento registrato.")
                         st.rerun()
     with tab1:
         if m.empty:
@@ -1171,7 +1302,7 @@ def pagina_cassa():
         out = v[["Data", "descrizione", "categoria", "Entrata", "Uscita", "metodo", "rif_tipo", "note"]].rename(
             columns={"descrizione": "Descrizione", "categoria": "Categoria", "metodo": "Metodo",
                      "rif_tipo": "Collegato a", "note": "Note"})
-        st.dataframe(out, hide_index=True, use_container_width=True,
+        st.dataframe(out, hide_index=True, width="stretch",
                      column_config={k: st.column_config.NumberColumn(format="€ %.2f") for k in ["Entrata", "Uscita"]})
         st.caption(f"{len(v)} movimenti · entrate {euro(v['Entrata'].sum())} · uscite {euro(v['Uscita'].sum())}")
         st.download_button("⬇️ Scarica cassa", to_excel({"Cassa": out}), "cassa.xlsx")
@@ -1222,7 +1353,7 @@ def pagina_fatture():
                  "residuo", "stato"]].rename(columns={"numero": "N.", "categoria": "Categoria",
                                                       "descrizione": "Descrizione", "importo": "Importo",
                                                       "pagato": "Pagato", "residuo": "Residuo", "stato": "Stato"})
-            st.dataframe(out, hide_index=True, use_container_width=True,
+            st.dataframe(out, hide_index=True, width="stretch",
                          column_config={k: st.column_config.NumberColumn(format="€ %.2f")
                                         for k in ["Importo", "Pagato", "Residuo"]})
             aperte = f[f["stato"] != "Pagata"]
@@ -1244,7 +1375,7 @@ def pagina_fatture():
                         aggiorna("Fatture", fid, {"pagato": float(pagato), "stato": stato})
                         registra_movimento("Uscita", dt, r["categoria"],
                                            f"Fattura n.{r['numero']} – {r['Fornitore']}", imp, met, "Fattura", fid)
-                        st.success("Pagamento registrato anche in Cassa.")
+                        avviso("Pagamento registrato anche in Cassa.")
                         st.rerun()
             if puo_modificare():
                 with st.expander("🗑️ Elimina fattura"):
@@ -1287,7 +1418,7 @@ def pagina_fatture():
                             if gia:
                                 registra_movimento("Uscita", dt, cat, f"Fattura n.{num} – {nomi_f[fid]}",
                                                    imp, met, "Fattura", nid)
-                            st.success("Fattura salvata.")
+                            avviso("Fattura salvata.")
                             st.rerun()
 
     with tab3:
@@ -1315,7 +1446,7 @@ def pagina_fatture():
             tutte["res"] = tutte["importo"] - tutte["pagato"]
             forn["Da pagare"] = forn["id"].map(tutte.groupby("fornitore_id")["res"].sum()).fillna(0.0)
             st.dataframe(forn.drop(columns=["id"]).rename(columns=str.capitalize), hide_index=True,
-                         use_container_width=True,
+                         width="stretch",
                          column_config={"Da pagare": st.column_config.NumberColumn(format="€ %.2f")})
             if puo_modificare():
                 with st.expander("🗑️ Elimina fornitore"):
@@ -1346,7 +1477,7 @@ def pagina_sponsor():
                      .rename(columns={"nome": "Sponsor", "referente": "Referente", "telefono": "Telefono",
                                       "importo_concordato": "Concordato", "incassato": "Incassato",
                                       "da_incassare": "Da incassare", "note": "Note"}),
-                     hide_index=True, use_container_width=True,
+                     hide_index=True, width="stretch",
                      column_config={k: st.column_config.NumberColumn(format="€ %.2f")
                                     for k in ["Concordato", "Incassato", "Da incassare"]})
     else:
@@ -1437,7 +1568,7 @@ def pagina_scadenze():
     v = sc[sc["stato"] != "Fatto"] if filtro == "Da fare" else sc
     st.dataframe(v[["Stato", "Data", "tipo", "descrizione", "Tesserato", "note"]].rename(
         columns={"tipo": "Tipo", "descrizione": "Descrizione", "note": "Note"}),
-        hide_index=True, use_container_width=True)
+        hide_index=True, width="stretch")
     if puo_modificare() and len(v):
         c = st.columns([3, 1, 1])
         sid = c[0].selectbox("Scadenza", v["id"].tolist(), format_func=lambda i:
@@ -1478,7 +1609,7 @@ def pagina_impostazioni():
         st.dataframe(s.assign(data_inizio=s["data_inizio"].apply(fmt_data),
                               data_fine=s["data_fine"].apply(fmt_data))
                      .rename(columns={"stagione": "Stagione", "data_inizio": "Inizio", "data_fine": "Fine",
-                                      "attiva": "Attiva"}), hide_index=True, use_container_width=True)
+                                      "attiva": "Attiva"}), hide_index=True, width="stretch")
         st.markdown("##### ➕ Nuova stagione")
         ultimo = max([int(x[:4]) for x in s["stagione"] if str(x)[:4].isdigit()] or [oggi().year - 1])
         with st.form("stg"):
@@ -1497,7 +1628,7 @@ def pagina_impostazioni():
                             aggiorna("Stagioni", x, {"attiva": "NO"}, chiave_col="stagione")
                     aggiungi("Stagioni", {"stagione": nome, "data_inizio": di.isoformat(),
                                           "data_fine": dfin.isoformat(), "attiva": "SI" if att else "NO"})
-                    st.success(f"Stagione {nome} creata.")
+                    avviso(f"Stagione {nome} creata.")
                     st.rerun()
         if len(s) > 1:
             c = st.columns([2, 1])
@@ -1532,7 +1663,7 @@ def pagina_impostazioni():
         r = df("Ruoli")
         st.dataframe(r.rename(columns={"ruolo": "Ruolo", "pagine": "Pagine visibili",
                                        "puo_modificare": "Può modificare", "vede_importi": "Vede importi"}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         admin = impostazione("ruolo_admin", "Presidente")
         scelta = st.selectbox("Crea o modifica ruolo", ["➕ Nuovo ruolo"] + r["ruolo"].tolist())
         esist = r[r["ruolo"] == scelta].iloc[0].to_dict() if scelta in r["ruolo"].values else {}
@@ -1569,7 +1700,7 @@ def pagina_impostazioni():
     with t5:
         u = df("Utenti")
         st.dataframe(u[["username", "nome", "ruolo", "attivo"]].rename(columns=str.capitalize),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         ruoli = df("Ruoli")["ruolo"].tolist()
         st.markdown("##### ➕ Nuovo utente")
         with st.form("utente", clear_on_submit=True):
@@ -1609,13 +1740,13 @@ def pagina_impostazioni():
                             st.stop()
                         campi["password_hash"] = hash_pw(npw)
                     aggiorna("Utenti", sel, campi, chiave_col="username")
-                    st.success("Utente aggiornato.")
+                    avviso("Utente aggiornato.")
                     st.rerun()
 
     with t6:
         lg = df("Log")
         st.dataframe(lg.iloc[::-1].head(300).rename(columns=str.capitalize), hide_index=True,
-                     use_container_width=True)
+                     width="stretch")
         st.markdown("##### 💾 Backup")
         st.download_button("⬇️ Scarica backup completo (Excel)",
                            to_excel({n: df(n).drop(columns=["password_hash"], errors="ignore") for n in SHEETS}),
@@ -1646,6 +1777,9 @@ def main():
         return
 
     applica_stile(impostazione("colore_1", "#1f7a3a"), impostazione("colore_2", "#ffffff"))
+    msg = st.session_state.pop("_avviso", None)
+    if msg:
+        st.toast(msg)
     stagioni = df("Stagioni")
     elenco = sorted(stagioni["stagione"].tolist(), reverse=True) or [stagione_da_data(oggi())]
     attiva = stagioni[stagioni["attiva"] == "SI"]["stagione"].tolist()
@@ -1654,7 +1788,7 @@ def main():
 
     info = ruolo_info()
     with st.sidebar:
-        st.markdown(f"## ⚽ {impostazione('nome_squadra', 'La mia squadra')}")
+        stemma()
         st.selectbox("Stagione", elenco, key="stagione")
         pagine = [p for p in PAGINE if p in info["pagine"]] or ["Panoramica"]
         pagina = st.radio("Menu", pagine, format_func=lambda p: f"{ICONE[p]}  {p}", label_visibility="collapsed")
@@ -1663,10 +1797,10 @@ def main():
         st.caption(f"👤 {u['nome']} · {u['ruolo']}")
         st.caption(f"🕒 {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}")
         c = st.columns(2)
-        if c[0].button("🔄 Aggiorna", use_container_width=True):
+        if c[0].button("🔄 Aggiorna", width="stretch"):
             leggi_tutto.clear()
             st.rerun()
-        if c[1].button("🚪 Esci", use_container_width=True):
+        if c[1].button("🚪 Esci", width="stretch"):
             for k in ["utente", "stagione"]:
                 st.session_state.pop(k, None)
             st.rerun()

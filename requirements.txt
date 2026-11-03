@@ -1,6 +1,7 @@
-streamlit>=1.40
+streamlit>=1.50
 gspread>=6.0
 google-auth>=2.20
 pandas>=2.0
 openpyxl>=3.1
 altair>=5.0
+tzdata
