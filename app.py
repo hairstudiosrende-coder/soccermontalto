@@ -1,0 +1,1593 @@
+# -*- coding: utf-8 -*-
+"""
+GESTIONE SQUADRA – prototipo
+Streamlit + Google Sheets
+Gestione per STAGIONE (es. 2026/2027): rosa e staff, contratti, pagamenti,
+cassa, fornitori e fatture, sponsor, scadenze, ruoli e utenti.
+"""
+
+import hashlib
+import io
+import os
+import uuid
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import altair as alt
+import gspread
+import pandas as pd
+import streamlit as st
+
+TZ = ZoneInfo("Europe/Rome")
+
+st.set_page_config(page_title="Gestione Squadra", page_icon="⚽", layout="wide")
+
+# ════════════════════════════════════════════════════════════════════
+# STRUTTURA DEI FOGLI
+# ════════════════════════════════════════════════════════════════════
+SHEETS = {
+    "Impostazioni": ["chiave", "valore"],
+    "Stagioni": ["stagione", "data_inizio", "data_fine", "attiva"],
+    "Ruoli": ["ruolo", "pagine", "puo_modificare", "vede_importi"],
+    "Utenti": ["username", "password_hash", "nome", "ruolo", "attivo"],
+    "Categorie": ["tipo", "nome"],
+    "Tesserati": ["id", "stagione", "tipo", "reparto", "cognome", "nome", "anno_nascita",
+                  "provenienza", "telefono", "email", "iban", "compenso_stagione",
+                  "stato", "note"],
+    "Voci_Contratto": ["id", "stagione", "tesserato_id", "voce", "importo", "note"],
+    "Pagamenti": ["id", "data", "stagione", "tesserato_id", "mese_rif", "voce", "importo",
+                  "metodo", "note", "utente", "mov_id"],
+    "Fornitori": ["id", "nome", "categoria", "piva", "telefono", "email", "iban", "note"],
+    "Fatture": ["id", "stagione", "fornitore_id", "numero", "data", "scadenza", "categoria",
+                "descrizione", "importo", "pagato", "stato", "note"],
+    "Movimenti": ["id", "data", "stagione", "tipo", "categoria", "descrizione", "importo",
+                  "metodo", "rif_tipo", "rif_id", "utente", "note"],
+    "Sponsor": ["id", "stagione", "nome", "referente", "telefono", "importo_concordato", "note"],
+    "Scadenze": ["id", "stagione", "tipo", "descrizione", "tesserato_id", "data_scadenza",
+                 "stato", "note"],
+    "Log": ["timestamp", "utente", "azione", "foglio", "dettaglio"],
+}
+NUM_COLS = {"compenso_stagione", "importo", "pagato", "importo_concordato"}
+
+PAGINE = ["Panoramica", "Rosa & Staff", "Pagamenti", "Cassa", "Fornitori & Fatture",
+          "Sponsor", "Scadenze", "Impostazioni"]
+ICONE = {"Panoramica": "🏟️", "Rosa & Staff": "👥", "Pagamenti": "💶", "Cassa": "💰",
+         "Fornitori & Fatture": "🧾", "Sponsor": "🤝", "Scadenze": "📅", "Impostazioni": "⚙️"}
+
+# Tipi di categoria (tutte modificabili da Impostazioni → Categorie)
+TIPI_CATEGORIA = {
+    "TESSERATO": "Tipo tesserato",
+    "REPARTO": "Reparto / Area",
+    "VOCE_CONTRATTO": "Voce contratto",
+    "ENTRATA": "Categoria entrata",
+    "USCITA": "Categoria uscita",
+    "SCADENZA": "Tipo scadenza",
+    "METODO": "Metodo di pagamento",
+    "FORNITORE": "Categoria fornitore",
+}
+CATEGORIE_DEFAULT = {
+    "TESSERATO": ["Giocatore", "Allenatore", "Vice allenatore", "Preparatore atletico",
+                  "Preparatore portieri", "Fisioterapista / Massaggiatore", "Medico",
+                  "Team manager", "Magazziniere", "Dirigente"],
+    "REPARTO": ["Portieri", "Difensori", "Centrocampisti", "Attaccanti", "Staff tecnico",
+                "Staff medico", "Dirigenza"],
+    "VOCE_CONTRATTO": ["Compenso", "Alloggio", "Vitto", "Volo / Viaggi", "Procura", "Premio",
+                       "Spese mediche", "Rimborso spese"],
+    "ENTRATA": ["Sponsor", "Contributo Comune / Regione", "Contributo Federazione / Lega",
+                "Quote soci", "Biglietteria / Abbonamenti", "Cessione giocatori",
+                "Bar / Merchandising", "Eventi / Cene", "Donazioni", "Versamento presidente",
+                "Altro"],
+    "USCITA": ["Compensi giocatori", "Compensi staff", "Alloggi", "Vitto / Ristoranti",
+               "Trasferte / Viaggi", "Voli", "Procuratori", "Materiale sportivo",
+               "Abbigliamento", "Attrezzatura / Tecnologia", "Iscrizioni / Tesseramenti",
+               "Arbitri / Ambulanza", "Affitto campo", "Utenze", "Spese mediche",
+               "Assicurazioni", "Commercialista", "Altro"],
+    "SCADENZA": ["Visita medica", "Tesseramento", "Iscrizione campionato", "Assicurazione",
+                 "Scadenza contratto", "Pagamento", "Altro"],
+    "METODO": ["Contanti", "Bonifico", "Carta / POS", "Assegno"],
+    "FORNITORE": ["Materiale sportivo", "Ristorazione", "Alloggi", "Trasporti",
+                  "Servizi medici", "Tecnologia", "Stampa / Grafica", "Altro"],
+}
+# Voce contratto → categoria di uscita in cassa
+VOCE_TO_USCITA = {"Alloggio": "Alloggi", "Vitto": "Vitto / Ristoranti", "Volo / Viaggi": "Voli",
+                  "Procura": "Procuratori", "Spese mediche": "Spese mediche"}
+
+MESI = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno", "Luglio", "Agosto",
+        "Settembre", "Ottobre", "Novembre", "Dicembre"]
+
+
+# ════════════════════════════════════════════════════════════════════
+# UTILITÀ
+# ════════════════════════════════════════════════════════════════════
+def oggi():
+    return datetime.now(TZ).date()
+
+
+def adesso():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def nuovo_id(prefix):
+    return f"{prefix}{uuid.uuid4().hex[:8]}"
+
+
+def to_num(v):
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).replace("€", "").replace(" ", "").strip()
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def parse_date(v):
+    if v in (None, ""):
+        return None
+    if isinstance(v, (int, float)):  # data seriale di Google Sheets
+        return (datetime(1899, 12, 30) + timedelta(days=float(v))).date()
+    s = str(v).strip()[:10]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def fmt_data(v):
+    d = parse_date(v)
+    return d.strftime("%d/%m/%Y") if d else ""
+
+
+def euro(x):
+    s = f"{to_num(x):,.2f}"
+    return "€ " + s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def hash_pw(pw, salt=None):
+    salt = salt or uuid.uuid4().hex[:16]
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 120_000).hex()
+    return f"{salt}${h}"
+
+
+def check_pw(pw, stored):
+    try:
+        salt, _ = str(stored).split("$", 1)
+    except ValueError:
+        return False
+    return hash_pw(pw, salt) == stored
+
+
+def stagione_da_anno(anno):
+    return f"{anno}/{anno + 1}"
+
+
+def stagione_da_data(d):
+    return stagione_da_anno(d.year if d.month >= 7 else d.year - 1)
+
+
+def to_excel(dfs: dict):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for nome, df in dfs.items():
+            df.to_excel(xw, sheet_name=nome[:31], index=False)
+    return buf.getvalue()
+
+
+# ════════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS
+# ════════════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner=False)
+def book():
+    creds = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(creds)
+    sid = st.secrets.get("SHEET_ID", "")
+    if sid.startswith("http"):
+        return gc.open_by_url(sid)
+    return gc.open_by_key(sid)
+
+
+@st.cache_resource(show_spinner="Preparo il foglio Google…")
+def worksheets():
+    """Crea i fogli mancanti e le colonne mancanti. Restituisce {nome: worksheet}."""
+    sh = book()
+    esistenti = {ws.title: ws for ws in sh.worksheets()}
+    for nome, cols in SHEETS.items():
+        if nome not in esistenti:
+            ws = sh.add_worksheet(title=nome, rows=200, cols=max(len(cols), 8))
+            ws.update(range_name="A1", values=[cols], value_input_option="RAW")
+            esistenti[nome] = ws
+        else:
+            ws = esistenti[nome]
+            header = [h.strip() for h in ws.row_values(1)]
+            if not header:
+                ws.update(range_name="A1", values=[cols], value_input_option="RAW")
+            else:
+                mancanti = [c for c in cols if c not in header]
+                if mancanti:
+                    nuovo = header + mancanti
+                    if ws.col_count < len(nuovo):
+                        ws.add_cols(len(nuovo) - ws.col_count)
+                    ws.update(range_name="A1", values=[nuovo], value_input_option="RAW")
+    return esistenti
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def leggi_tutto():
+    """Una sola chiamata a Google per leggere tutti i fogli."""
+    worksheets()
+    nomi = list(SHEETS.keys())
+    res = book().values_batch_get(
+        ranges=[f"'{n}'" for n in nomi],
+        params={"valueRenderOption": "UNFORMATTED_VALUE"},
+    )
+    out = {}
+    for nome, vr in zip(nomi, res.get("valueRanges", [])):
+        vals = vr.get("values", [])
+        cols = SHEETS[nome]
+        if not vals:
+            out[nome] = pd.DataFrame(columns=cols)
+            continue
+        header = [str(h).strip() for h in vals[0]]
+        w = len(header)
+        righe = [(list(r) + [""] * w)[:w] for r in vals[1:]
+                 if any(str(c).strip() for c in r)]
+        df = pd.DataFrame(righe, columns=header)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[cols].copy()
+        for c in cols:
+            if c in NUM_COLS:
+                df[c] = df[c].apply(to_num)
+            else:
+                df[c] = df[c].apply(lambda x: "" if x is None else
+                                    (str(int(x)) if isinstance(x, float) and x.is_integer()
+                                     else str(x)).strip())
+        out[nome] = df
+    return out
+
+
+def df(nome):
+    return leggi_tutto()[nome].copy()
+
+
+def _riga_valori(nome, rec):
+    header = [h.strip() for h in worksheets()[nome].row_values(1)]
+    return [rec.get(c, "") if rec.get(c, "") is not None else "" for c in header]
+
+
+def aggiungi(nome, rec, log=True):
+    ws = worksheets()[nome]
+    ws.append_row(_riga_valori(nome, rec), value_input_option="RAW",
+                  insert_data_option="INSERT_ROWS", table_range="A1")
+    if log:
+        scrivi_log("Aggiunto", nome, rec.get("id") or rec.get("nome") or rec.get("chiave", ""))
+    leggi_tutto.clear()
+
+
+def _trova_riga(nome, chiave_col, valore):
+    ws = worksheets()[nome]
+    header = [h.strip() for h in ws.row_values(1)]
+    idx = header.index(chiave_col) + 1
+    colonna = ws.col_values(idx)
+    for i, v in enumerate(colonna[1:], start=2):
+        if str(v).strip() == str(valore).strip():
+            return i, header
+    return None, header
+
+
+def aggiorna(nome, valore, campi: dict, chiave_col="id"):
+    ws = worksheets()[nome]
+    r, header = _trova_riga(nome, chiave_col, valore)
+    if r is None:
+        return False
+    attuale = ws.row_values(r)
+    attuale = (attuale + [""] * len(header))[:len(header)]
+    for k, v in campi.items():
+        if k in header:
+            attuale[header.index(k)] = v
+    ws.update(range_name=f"A{r}", values=[attuale], value_input_option="RAW")
+    scrivi_log("Modificato", nome, f"{valore}: {', '.join(campi.keys())}")
+    leggi_tutto.clear()
+    return True
+
+
+def elimina(nome, valore, chiave_col="id", extra=None):
+    ws = worksheets()[nome]
+    r, _ = _trova_riga(nome, chiave_col, valore)
+    if r is None:
+        return False
+    if extra is not None:  # per fogli con chiave non univoca (Categorie)
+        righe = ws.get_all_values()
+        header = [h.strip() for h in righe[0]]
+        r = None
+        for i, riga in enumerate(righe[1:], start=2):
+            riga = (riga + [""] * len(header))[:len(header)]
+            if riga[header.index(chiave_col)] == valore and all(
+                    riga[header.index(k)] == v for k, v in extra.items()):
+                r = i
+                break
+        if r is None:
+            return False
+    ws.delete_rows(r)
+    scrivi_log("Eliminato", nome, str(valore))
+    leggi_tutto.clear()
+    return True
+
+
+def scrivi_log(azione, foglio, dettaglio):
+    try:
+        worksheets()["Log"].append_row(
+            [adesso(), st.session_state.get("utente", {}).get("username", "-"),
+             azione, foglio, str(dettaglio)[:300]], value_input_option="RAW")
+    except Exception:
+        pass
+
+
+def impostazione(chiave, default=""):
+    imp = df("Impostazioni")
+    r = imp[imp["chiave"] == chiave]
+    return r.iloc[0]["valore"] if len(r) else default
+
+
+def salva_impostazione(chiave, valore):
+    imp = df("Impostazioni")
+    if (imp["chiave"] == chiave).any():
+        aggiorna("Impostazioni", chiave, {"valore": valore}, chiave_col="chiave")
+    else:
+        aggiungi("Impostazioni", {"chiave": chiave, "valore": valore}, log=False)
+
+
+def categorie(tipo):
+    c = df("Categorie")
+    lista = c[c["tipo"] == tipo]["nome"].tolist()
+    return lista or CATEGORIE_DEFAULT.get(tipo, ["Altro"])
+
+
+# ════════════════════════════════════════════════════════════════════
+# PERMESSI
+# ════════════════════════════════════════════════════════════════════
+def ruolo_info():
+    u = st.session_state.get("utente")
+    if not u:
+        return {"pagine": [], "modifica": False, "importi": False}
+    r = df("Ruoli")
+    r = r[r["ruolo"] == u["ruolo"]]
+    if not len(r):
+        return {"pagine": ["Panoramica"], "modifica": False, "importi": False}
+    r = r.iloc[0]
+    pagine = [p.strip() for p in str(r["pagine"]).split(",") if p.strip() in PAGINE]
+    return {"pagine": pagine,
+            "modifica": str(r["puo_modificare"]).upper() == "SI",
+            "importi": str(r["vede_importi"]).upper() == "SI"}
+
+
+def puo_modificare():
+    return ruolo_info()["modifica"]
+
+
+def vede_importi():
+    return ruolo_info()["importi"]
+
+
+# ════════════════════════════════════════════════════════════════════
+# GRAFICA – stile campo da calcio
+# ════════════════════════════════════════════════════════════════════
+def applica_stile(c1="#1f7a3a", c2="#ffffff"):
+    st.markdown(f"""
+    <style>
+    :root {{ --c1:{c1}; --c2:{c2}; --oro:#d4af37; --prato:#0b3d2e; }}
+    .stApp {{
+        background:
+          repeating-linear-gradient(90deg, #0b3d2e 0 90px, #0d4434 90px 180px);
+    }}
+    [data-testid="stSidebar"] > div:first-child {{
+        background: linear-gradient(180deg, #07291f 0%, #0b3d2e 100%);
+        border-right: 2px solid rgba(255,255,255,.15);
+    }}
+    h1, h2, h3 {{ letter-spacing:.3px; }}
+    .banner {{
+        position:relative; overflow:hidden; border-radius:16px; padding:22px 26px;
+        background: linear-gradient(120deg, var(--c1) 0%, #0b3d2e 75%);
+        border:2px solid rgba(255,255,255,.55); margin-bottom:18px;
+    }}
+    .banner:before {{ /* linea di metà campo */
+        content:""; position:absolute; top:0; bottom:0; left:62%;
+        border-left:2px solid rgba(255,255,255,.25);
+    }}
+    .banner:after {{ /* cerchio di centrocampo */
+        content:""; position:absolute; width:150px; height:150px; border-radius:50%;
+        border:2px solid rgba(255,255,255,.25); left:calc(62% - 75px); top:calc(50% - 75px);
+    }}
+    .banner .t {{ font-size:30px; font-weight:800; color:var(--c2); line-height:1.1; }}
+    .banner .s {{ font-size:15px; color:#f5f5f0; opacity:.9; margin-top:6px; }}
+    .banner .badge {{
+        display:inline-block; margin-top:10px; padding:3px 12px; border-radius:20px;
+        background:var(--oro); color:#0b3d2e; font-weight:700; font-size:13px;
+    }}
+    .kpi {{
+        background: rgba(7,41,31,.85); border:1px solid rgba(255,255,255,.18);
+        border-left:5px solid var(--c1); border-radius:12px; padding:14px 16px; height:100%;
+    }}
+    .kpi .l {{ font-size:12px; text-transform:uppercase; letter-spacing:.8px; opacity:.75; }}
+    .kpi .v {{ font-size:24px; font-weight:800; margin-top:4px; }}
+    .kpi .n {{ font-size:12px; opacity:.7; margin-top:2px; }}
+    .kpi.pos .v {{ color:#7CFC9A; }} .kpi.neg .v {{ color:#ff8a80; }} .kpi.gold .v {{ color:var(--oro); }}
+    .pill {{ padding:2px 10px; border-radius:12px; font-size:12px; font-weight:700; }}
+    .stTabs [data-baseweb="tab"] {{ font-weight:600; }}
+    [data-testid="stForm"] {{ background: rgba(7,41,31,.6); border-radius:12px; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def banner(titolo, sottotitolo=""):
+    nome = impostazione("nome_squadra", "La mia squadra")
+    stg = st.session_state.get("stagione", "")
+    st.markdown(f"""<div class="banner"><div class="t">{ICONE.get(titolo, '⚽')} {titolo}</div>
+        <div class="s">{nome}{' · ' + sottotitolo if sottotitolo else ''}</div>
+        <span class="badge">Stagione {stg}</span></div>""", unsafe_allow_html=True)
+
+
+def kpi(col, label, valore, nota="", tono=""):
+    col.markdown(f"""<div class="kpi {tono}"><div class="l">{label}</div>
+        <div class="v">{valore}</div><div class="n">{nota}</div></div>""",
+                 unsafe_allow_html=True)
+
+
+def grafico_tema(ch):
+    return (ch.configure(background="transparent")
+            .configure_axis(labelColor="#f5f5f0", titleColor="#f5f5f0",
+                            gridColor="rgba(255,255,255,.12)", domainColor="#f5f5f0")
+            .configure_legend(labelColor="#f5f5f0", titleColor="#f5f5f0")
+            .configure_view(strokeWidth=0))
+
+
+# ════════════════════════════════════════════════════════════════════
+# DATI CALCOLATI
+# ════════════════════════════════════════════════════════════════════
+def stagione_corrente_df(nome):
+    d = df(nome)
+    return d[d["stagione"] == st.session_state["stagione"]].copy()
+
+
+def mesi_stagione():
+    s = df("Stagioni")
+    r = s[s["stagione"] == st.session_state["stagione"]]
+    anno = int(st.session_state["stagione"][:4])
+    inizio = parse_date(r.iloc[0]["data_inizio"]) if len(r) else None
+    fine = parse_date(r.iloc[0]["data_fine"]) if len(r) else None
+    inizio = inizio or date(anno, 7, 1)
+    fine = fine or date(anno + 1, 6, 30)
+    out, d = [], date(inizio.year, inizio.month, 1)
+    while d <= fine:
+        out.append(f"{MESI[d.month - 1]} {d.year}")
+        d = date(d.year + (d.month == 12), d.month % 12 + 1, 1)
+    return out
+
+
+def nome_completo(r):
+    return f"{r['cognome']} {r['nome']}".strip()
+
+
+def tesserati_con_saldi():
+    t = stagione_corrente_df("Tesserati")
+    if t.empty:
+        return t.assign(extra=0.0, totale=0.0, pagato=0.0, residuo=0.0, nominativo="")
+    v = stagione_corrente_df("Voci_Contratto")
+    p = stagione_corrente_df("Pagamenti")
+    extra = v.groupby("tesserato_id")["importo"].sum()
+    pag = p.groupby("tesserato_id")["importo"].sum()
+    t["extra"] = t["id"].map(extra).fillna(0.0)
+    t["totale"] = t["compenso_stagione"] + t["extra"]
+    t["pagato"] = t["id"].map(pag).fillna(0.0)
+    t["residuo"] = t["totale"] - t["pagato"]
+    t["nominativo"] = t.apply(nome_completo, axis=1)
+    return t
+
+
+def ordina_reparti(t):
+    ordine = {r: i for i, r in enumerate(categorie("REPARTO"))}
+    t["_o"] = t["reparto"].map(ordine).fillna(99)
+    return t.sort_values(["_o", "cognome", "nome"]).drop(columns="_o")
+
+
+def mappa_tesserati():
+    t = stagione_corrente_df("Tesserati")
+    return {r["id"]: nome_completo(r) for _, r in t.iterrows()}
+
+
+def registra_movimento(tipo, data_mov, categoria, descrizione, importo, metodo,
+                       rif_tipo="", rif_id="", note=""):
+    mid = nuovo_id("M")
+    aggiungi("Movimenti", {
+        "id": mid, "data": data_mov.isoformat(), "stagione": st.session_state["stagione"],
+        "tipo": tipo, "categoria": categoria, "descrizione": descrizione,
+        "importo": float(importo), "metodo": metodo, "rif_tipo": rif_tipo, "rif_id": rif_id,
+        "utente": st.session_state["utente"]["username"], "note": note})
+    return mid
+
+
+def blocca_se_sola_lettura():
+    if not puo_modificare():
+        st.info("🔒 Il tuo ruolo è in sola lettura per questa sezione.")
+        return True
+    return False
+
+
+# ════════════════════════════════════════════════════════════════════
+# PRIMO ACCESSO
+# ════════════════════════════════════════════════════════════════════
+def pagina_setup():
+    applica_stile()
+    st.markdown("""<div class="banner"><div class="t">⚽ Benvenuto</div>
+        <div class="s">Primo accesso: crea la tua squadra e l'utente amministratore</div>
+        </div>""", unsafe_allow_html=True)
+    anno = oggi().year if oggi().month >= 7 else oggi().year - 1
+    with st.form("setup"):
+        c1, c2 = st.columns(2)
+        nome = c1.text_input("Nome squadra *")
+        citta = c2.text_input("Città")
+        c3, c4, c5 = st.columns(3)
+        col1 = c3.color_picker("Colore sociale 1", "#1f7a3a")
+        col2 = c4.color_picker("Colore sociale 2", "#ffffff")
+        anni = list(range(anno - 2, anno + 3))
+        a = c5.selectbox("Stagione iniziale", anni, index=2,
+                         format_func=stagione_da_anno)
+        st.markdown("**Amministratore** (ruolo *Presidente*, accesso completo)")
+        c6, c7, c8 = st.columns(3)
+        nome_admin = c6.text_input("Nome e cognome *")
+        user = c7.text_input("Username *")
+        pw = c8.text_input("Password * (min. 6 caratteri)", type="password")
+        ok = st.form_submit_button("Crea squadra", type="primary", use_container_width=True)
+    if ok:
+        if not nome.strip() or not user.strip() or len(pw) < 6 or not nome_admin.strip():
+            st.error("Compila tutti i campi obbligatori (password di almeno 6 caratteri).")
+            return
+        with st.spinner("Creo la squadra…"):
+            for k, v in {"nome_squadra": nome.strip(), "citta": citta.strip(),
+                         "colore_1": col1, "colore_2": col2, "ruolo_admin": "Presidente",
+                         "setup_completato": "SI"}.items():
+                salva_impostazione(k, v)
+            stg = stagione_da_anno(a)
+            if not (df("Stagioni")["stagione"] == stg).any():
+                aggiungi("Stagioni", {"stagione": stg, "data_inizio": f"{a}-07-01",
+                                      "data_fine": f"{a + 1}-06-30", "attiva": "SI"})
+            if not (df("Ruoli")["ruolo"] == "Presidente").any():
+                aggiungi("Ruoli", {"ruolo": "Presidente", "pagine": ",".join(PAGINE),
+                                   "puo_modificare": "SI", "vede_importi": "SI"})
+            aggiungi("Utenti", {"username": user.strip().lower(), "password_hash": hash_pw(pw),
+                                "nome": nome_admin.strip(), "ruolo": "Presidente",
+                                "attivo": "SI"})
+            if df("Categorie").empty:
+                righe = [[t, n] for t, lista in CATEGORIE_DEFAULT.items() for n in lista]
+                worksheets()["Categorie"].append_rows(righe, value_input_option="RAW")
+                leggi_tutto.clear()
+        st.success("Squadra creata! Ora accedi.")
+        st.rerun()
+
+
+def pagina_login():
+    applica_stile(impostazione("colore_1", "#1f7a3a"), impostazione("colore_2", "#ffffff"))
+    nome = impostazione("nome_squadra", "La mia squadra")
+    _, c, _ = st.columns([1, 1.3, 1])
+    with c:
+        st.markdown(f"""<div class="banner" style="text-align:center"><div class="t">⚽ {nome}</div>
+            <div class="s">Area riservata – gestione società</div></div>""",
+                    unsafe_allow_html=True)
+        with st.form("login"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            ok = st.form_submit_button("Entra", type="primary", use_container_width=True)
+        if ok:
+            ut = df("Utenti")
+            r = ut[(ut["username"] == u.strip().lower()) & (ut["attivo"].str.upper() == "SI")]
+            if len(r) and check_pw(p, r.iloc[0]["password_hash"]):
+                st.session_state["utente"] = r.iloc[0].to_dict()
+                scrivi_log("Accesso", "-", u)
+                st.rerun()
+            else:
+                st.error("Credenziali non valide.")
+
+
+# ════════════════════════════════════════════════════════════════════
+# PANORAMICA
+# ════════════════════════════════════════════════════════════════════
+def pagina_panoramica():
+    banner("Panoramica", "come va la stagione")
+    t = tesserati_con_saldi()
+    sc = stagione_corrente_df("Scadenze")
+    giocatori = (t["tipo"] == "Giocatore").sum() if len(t) else 0
+
+    if not vede_importi():
+        c = st.columns(3)
+        kpi(c[0], "Giocatori in rosa", giocatori)
+        kpi(c[1], "Staff", len(t) - giocatori)
+        kpi(c[2], "Scadenze aperte", (sc["stato"] != "Fatto").sum() if len(sc) else 0)
+        sezione_scadenze_prossime(sc)
+        return
+
+    m = stagione_corrente_df("Movimenti")
+    entrate = m[m["tipo"] == "Entrata"]["importo"].sum()
+    uscite = m[m["tipo"] == "Uscita"]["importo"].sum()
+    saldo = entrate - uscite
+    contanti = (m[(m["metodo"] == "Contanti") & (m["tipo"] == "Entrata")]["importo"].sum()
+                - m[(m["metodo"] == "Contanti") & (m["tipo"] == "Uscita")]["importo"].sum())
+    residuo_t = t["residuo"].clip(lower=0).sum() if len(t) else 0
+    f = stagione_corrente_df("Fatture")
+    fatt_aperte = (f["importo"] - f["pagato"]).clip(lower=0).sum() if len(f) else 0
+    sp = stagione_corrente_df("Sponsor")
+    incassato_sp = m[m["rif_tipo"] == "Sponsor"]["importo"].sum()
+    sp_da_incassare = max(sp["importo_concordato"].sum() - incassato_sp, 0) if len(sp) else 0
+    previsione = saldo - residuo_t - fatt_aperte + sp_da_incassare
+
+    c = st.columns(4)
+    kpi(c[0], "Entrate stagione", euro(entrate), "", "pos")
+    kpi(c[1], "Uscite stagione", euro(uscite), "", "neg")
+    kpi(c[2], "Saldo cassa", euro(saldo), f"di cui contanti {euro(contanti)}",
+        "pos" if saldo >= 0 else "neg")
+    kpi(c[3], "Previsione fine stagione", euro(previsione),
+        "saldo − da pagare + sponsor da incassare", "gold")
+    st.write("")
+    c = st.columns(4)
+    kpi(c[0], "Da pagare a tesserati", euro(residuo_t), f"{len(t)} tesserati")
+    kpi(c[1], "Fatture da pagare", euro(fatt_aperte),
+        f"{(f['stato'] != 'Pagata').sum() if len(f) else 0} aperte")
+    kpi(c[2], "Sponsor da incassare", euro(sp_da_incassare), f"{len(sp)} sponsor")
+    kpi(c[3], "Rosa", f"{giocatori} giocatori", f"{len(t) - giocatori} staff")
+
+    st.write("")
+    g1, g2 = st.columns([1.3, 1])
+    with g1:
+        st.subheader("Entrate e uscite per mese")
+        if len(m):
+            m["d"] = m["data"].apply(parse_date)
+            m = m.dropna(subset=["d"])
+            m["mese"] = m["d"].apply(lambda d: f"{d.year}-{d.month:02d}")
+            agg = m.groupby(["mese", "tipo"])["importo"].sum().reset_index()
+            ch = alt.Chart(agg).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+                x=alt.X("mese:N", title=None), xOffset="tipo:N",
+                y=alt.Y("importo:Q", title="€"),
+                color=alt.Color("tipo:N", scale=alt.Scale(domain=["Entrata", "Uscita"],
+                                                          range=["#7CFC9A", "#ff8a80"]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["mese", "tipo", alt.Tooltip("importo:Q", format=",.2f")])
+            st.altair_chart(grafico_tema(ch.properties(height=300)), use_container_width=True)
+        else:
+            st.caption("Nessun movimento ancora registrato.")
+    with g2:
+        st.subheader("Dove vanno i soldi")
+        u = m[m["tipo"] == "Uscita"] if len(m) else m
+        if len(u):
+            agg = u.groupby("categoria")["importo"].sum().sort_values(ascending=False)
+            agg = agg.head(8).reset_index()
+            ch = alt.Chart(agg).mark_bar(color="#d4af37", cornerRadiusEnd=4).encode(
+                y=alt.Y("categoria:N", sort="-x", title=None),
+                x=alt.X("importo:Q", title="€"),
+                tooltip=["categoria", alt.Tooltip("importo:Q", format=",.2f")])
+            st.altair_chart(grafico_tema(ch.properties(height=300)), use_container_width=True)
+        else:
+            st.caption("Nessuna uscita ancora registrata.")
+
+    sezione_scadenze_prossime(sc)
+
+
+def sezione_scadenze_prossime(sc):
+    st.subheader("📅 Scadenze nei prossimi 30 giorni")
+    if sc.empty:
+        st.caption("Nessuna scadenza inserita.")
+        return
+    sc = sc[sc["stato"] != "Fatto"].copy()
+    sc["d"] = sc["data_scadenza"].apply(parse_date)
+    sc = sc.dropna(subset=["d"])
+    sc = sc[sc["d"] <= oggi() + timedelta(days=30)].sort_values("d")
+    if sc.empty:
+        st.caption("Niente in scadenza. 👍")
+        return
+    mt = mappa_tesserati()
+    for _, r in sc.iterrows():
+        scaduta = r["d"] < oggi()
+        col = "#ff8a80" if scaduta else "#d4af37"
+        chi = f" · {mt.get(r['tesserato_id'], '')}" if r["tesserato_id"] else ""
+        st.markdown(f"<span class='pill' style='background:{col};color:#0b3d2e'>"
+                    f"{'SCADUTA' if scaduta else r['d'].strftime('%d/%m')}</span> "
+                    f"**{r['tipo']}** – {r['descrizione']}{chi}", unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════
+# ROSA & STAFF
+# ════════════════════════════════════════════════════════════════════
+def form_tesserato(key, r=None):
+    r = r or {}
+    tipi, reparti = categorie("TESSERATO"), categorie("REPARTO")
+    with st.form(key, clear_on_submit=r == {}):
+        c = st.columns(3)
+        cognome = c[0].text_input("Cognome *", r.get("cognome", ""))
+        nome = c[1].text_input("Nome", r.get("nome", ""))
+        tipo = c[2].selectbox("Tipo", tipi, index=tipi.index(r["tipo"]) if r.get("tipo") in tipi else 0)
+        c = st.columns(3)
+        reparto = c[0].selectbox("Reparto / Area", reparti,
+                                 index=reparti.index(r["reparto"]) if r.get("reparto") in reparti else 0)
+        anno = c[1].text_input("Anno di nascita", r.get("anno_nascita", ""))
+        prov = c[2].text_input("Provenienza (squadra precedente)", r.get("provenienza", ""))
+        c = st.columns(3)
+        tel = c[0].text_input("Telefono", r.get("telefono", ""))
+        mail = c[1].text_input("Email", r.get("email", ""))
+        iban = c[2].text_input("IBAN", r.get("iban", ""))
+        c = st.columns(3)
+        comp = c[0].number_input("Compenso stagione (€)", min_value=0.0, step=100.0,
+                                 value=float(r.get("compenso_stagione", 0) or 0))
+        stati = ["Attivo", "Svincolato", "Ceduto", "Infortunato"]
+        stato = c[1].selectbox("Stato", stati, index=stati.index(r["stato"]) if r.get("stato") in stati else 0)
+        note = st.text_area("Note", r.get("note", ""), height=80)
+        ok = st.form_submit_button("💾 Salva", type="primary")
+    if ok:
+        if not cognome.strip():
+            st.error("Il cognome è obbligatorio.")
+            return None
+        return {"tipo": tipo, "reparto": reparto, "cognome": cognome.strip().upper(),
+                "nome": nome.strip().upper(), "anno_nascita": anno.strip(),
+                "provenienza": prov.strip(), "telefono": tel.strip(), "email": mail.strip(),
+                "iban": iban.strip().replace(" ", "").upper(), "compenso_stagione": float(comp),
+                "stato": stato, "note": note.strip()}
+    return None
+
+
+def pagina_rosa():
+    banner("Rosa & Staff", "giocatori, mister, preparatori e contratti")
+    tab_rosa, tab_nuovo, tab_scheda = st.tabs(["📋 Rosa", "➕ Nuovo tesserato", "🗂️ Scheda e contratto"])
+    t = tesserati_con_saldi()
+    imp = vede_importi()
+    anno_stg = int(st.session_state["stagione"][:4])
+
+    with tab_rosa:
+        if t.empty:
+            st.info("Nessun tesserato in questa stagione. Aggiungilo da **➕ Nuovo tesserato**.")
+        else:
+            c = st.columns([2, 1])
+            cerca = c[0].text_input("🔍 Cerca", placeholder="cognome, nome, provenienza…")
+            solo = c[1].selectbox("Mostra", ["Tutti", "Solo giocatori", "Solo staff"])
+            v = ordina_reparti(t)
+            if cerca:
+                v = v[v.apply(lambda r: cerca.lower() in " ".join(map(str, r.values)).lower(), axis=1)]
+            if solo == "Solo giocatori":
+                v = v[v["tipo"] == "Giocatore"]
+            elif solo == "Solo staff":
+                v = v[v["tipo"] != "Giocatore"]
+            for rep in v["reparto"].unique():
+                g = v[v["reparto"] == rep].copy()
+                g["Età"] = g["anno_nascita"].apply(
+                    lambda a: anno_stg - int(a) if str(a).isdigit() else "")
+                cols = {"nominativo": "Nominativo", "tipo": "Tipo", "anno_nascita": "Anno",
+                        "Età": "Età", "provenienza": "Provenienza", "stato": "Stato"}
+                if imp:
+                    cols.update({"compenso_stagione": "Compenso", "extra": "Extra",
+                                 "totale": "Totale", "pagato": "Pagato", "residuo": "Residuo"})
+                st.markdown(f"#### {rep}  <span style='opacity:.6;font-size:14px'>({len(g)})</span>",
+                            unsafe_allow_html=True)
+                st.dataframe(g[list(cols)].rename(columns=cols), hide_index=True,
+                             use_container_width=True,
+                             column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                            for k in ["Compenso", "Extra", "Totale", "Pagato", "Residuo"]})
+            if imp:
+                c = st.columns(3)
+                kpi(c[0], "Totale contratti", euro(v["totale"].sum()))
+                kpi(c[1], "Pagato", euro(v["pagato"].sum()), tono="pos")
+                kpi(c[2], "Residuo", euro(v["residuo"].sum()), tono="gold")
+                st.write("")
+                st.download_button("⬇️ Scarica rosa in Excel", to_excel({"Rosa": v.drop(columns=["id"])}),
+                                   f"rosa_{st.session_state['stagione'].replace('/', '-')}.xlsx")
+
+    with tab_nuovo:
+        if not blocca_se_sola_lettura():
+            rec = form_tesserato("nuovo_tess")
+            if rec:
+                rec.update({"id": nuovo_id("T"), "stagione": st.session_state["stagione"]})
+                if not imp:
+                    rec["compenso_stagione"] = 0.0
+                aggiungi("Tesserati", rec)
+                st.success(f"✅ {rec['cognome']} {rec['nome']} aggiunto alla rosa.")
+
+    with tab_scheda:
+        if t.empty:
+            st.caption("Nessun tesserato.")
+            return
+        t = ordina_reparti(t)
+        sel = st.selectbox("Seleziona tesserato", t["id"].tolist(),
+                           format_func=lambda i: f"{t.set_index('id').loc[i, 'nominativo']} – "
+                                                 f"{t.set_index('id').loc[i, 'tipo']}")
+        r = t[t["id"] == sel].iloc[0].to_dict()
+        if imp:
+            c = st.columns(4)
+            kpi(c[0], "Compenso", euro(r["compenso_stagione"]))
+            kpi(c[1], "Extra contratto", euro(r["extra"]))
+            kpi(c[2], "Pagato", euro(r["pagato"]), tono="pos")
+            kpi(c[3], "Residuo", euro(r["residuo"]), tono="gold")
+            st.write("")
+
+        s1, s2, s3 = st.tabs(["✏️ Dati", "📑 Voci contratto", "💶 Pagamenti ricevuti"])
+        with s1:
+            if puo_modificare():
+                rec = form_tesserato(f"mod_{sel}", r)
+                if rec:
+                    if not imp:
+                        rec.pop("compenso_stagione")
+                    aggiorna("Tesserati", sel, rec)
+                    st.success("Dati aggiornati.")
+                    st.rerun()
+                with st.expander("🔁 Conferma per un'altra stagione"):
+                    stg = [s for s in df("Stagioni")["stagione"].tolist()
+                           if s != st.session_state["stagione"]]
+                    if not stg:
+                        st.caption("Crea prima la nuova stagione da Impostazioni → Stagioni.")
+                    else:
+                        c = st.columns(2)
+                        dest = c[0].selectbox("Stagione", stg, key=f"dst_{sel}")
+                        nuovo_comp = c[1].number_input("Nuovo compenso (€)", min_value=0.0,
+                                                       step=100.0, value=float(r["compenso_stagione"]),
+                                                       key=f"nc_{sel}")
+                        if st.button("Conferma tesserato", key=f"conf_{sel}"):
+                            nuovo = {k: r[k] for k in SHEETS["Tesserati"]}
+                            nuovo.update({"id": nuovo_id("T"), "stagione": dest,
+                                          "compenso_stagione": float(nuovo_comp), "stato": "Attivo"})
+                            aggiungi("Tesserati", nuovo)
+                            st.success(f"Confermato per la stagione {dest}.")
+                with st.expander("🗑️ Elimina tesserato"):
+                    st.warning("Elimina anche voci contratto e pagamenti collegati (i movimenti di cassa restano).")
+                    if st.checkbox("Confermo l'eliminazione", key=f"ck_{sel}") and \
+                            st.button("Elimina definitivamente", key=f"del_{sel}"):
+                        for vid in stagione_corrente_df("Voci_Contratto").query("tesserato_id == @sel")["id"]:
+                            elimina("Voci_Contratto", vid)
+                        for pid in stagione_corrente_df("Pagamenti").query("tesserato_id == @sel")["id"]:
+                            elimina("Pagamenti", pid)
+                        elimina("Tesserati", sel)
+                        st.rerun()
+            else:
+                for k in ["tipo", "reparto", "anno_nascita", "provenienza", "telefono", "email", "note"]:
+                    st.write(f"**{k.replace('_', ' ').capitalize()}:** {r[k]}")
+
+        with s2:
+            if not imp:
+                st.info("🔒 Il tuo ruolo non vede gli importi.")
+            else:
+                v = stagione_corrente_df("Voci_Contratto")
+                v = v[v["tesserato_id"] == sel]
+                if len(v):
+                    st.dataframe(v[["voce", "importo", "note"]].rename(
+                        columns={"voce": "Voce", "importo": "Importo", "note": "Note"}),
+                        hide_index=True, use_container_width=True,
+                        column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
+                else:
+                    st.caption("Solo compenso base. Aggiungi qui alloggio, vitto, volo, procura, premi…")
+                if puo_modificare():
+                    with st.form(f"voce_{sel}", clear_on_submit=True):
+                        c = st.columns([1.2, 1, 2])
+                        voce = c[0].selectbox("Voce", [x for x in categorie("VOCE_CONTRATTO") if x != "Compenso"]
+                                              or categorie("VOCE_CONTRATTO"))
+                        imp_v = c[1].number_input("Importo (€)", min_value=0.0, step=50.0)
+                        nt = c[2].text_input("Note")
+                        if st.form_submit_button("➕ Aggiungi voce"):
+                            aggiungi("Voci_Contratto", {"id": nuovo_id("V"), "stagione": st.session_state["stagione"],
+                                                        "tesserato_id": sel, "voce": voce,
+                                                        "importo": float(imp_v), "note": nt})
+                            st.rerun()
+                    if len(v):
+                        dv = st.selectbox("Elimina voce", [""] + v["id"].tolist(),
+                                          format_func=lambda i: "—" if not i else
+                                          f"{v.set_index('id').loc[i, 'voce']} {euro(v.set_index('id').loc[i, 'importo'])}")
+                        if dv and st.button("🗑️ Elimina voce"):
+                            elimina("Voci_Contratto", dv)
+                            st.rerun()
+        with s3:
+            if not imp:
+                st.info("🔒 Il tuo ruolo non vede gli importi.")
+            else:
+                p = stagione_corrente_df("Pagamenti")
+                p = p[p["tesserato_id"] == sel].copy()
+                if p.empty:
+                    st.caption("Nessun pagamento registrato.")
+                else:
+                    p["Data"] = p["data"].apply(fmt_data)
+                    st.dataframe(p[["Data", "mese_rif", "voce", "importo", "metodo", "note"]].rename(
+                        columns={"mese_rif": "Mese", "voce": "Voce", "importo": "Importo",
+                                 "metodo": "Metodo", "note": "Note"}),
+                        hide_index=True, use_container_width=True,
+                        column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
+
+
+# ════════════════════════════════════════════════════════════════════
+# PAGAMENTI
+# ════════════════════════════════════════════════════════════════════
+def pagina_pagamenti():
+    banner("Pagamenti", "compensi a giocatori e staff")
+    t = tesserati_con_saldi()
+    if t.empty:
+        st.info("Prima inserisci i tesserati in **Rosa & Staff**.")
+        return
+    t = ordina_reparti(t)
+    nomi = t.set_index("id")["nominativo"].to_dict()
+    mesi = mesi_stagione()
+    mese_corr = f"{MESI[oggi().month - 1]} {oggi().year}"
+    tab1, tab2, tab3, tab4 = st.tabs(["➕ Registra pagamento", "📊 Residui", "🗓️ Elenco del mese", "📜 Storico"])
+
+    with tab1:
+        if not blocca_se_sola_lettura():
+            with st.form("pag", clear_on_submit=True):
+                c = st.columns([2, 1, 1])
+                tid = c[0].selectbox("Tesserato", t["id"].tolist(), format_func=lambda i: nomi[i])
+                mese = c[1].selectbox("Mese di riferimento", mesi,
+                                      index=mesi.index(mese_corr) if mese_corr in mesi else 0)
+                dt = c[2].date_input("Data pagamento", oggi(), format="DD/MM/YYYY")
+                c = st.columns([1, 1, 1])
+                voce = c[0].selectbox("Voce", categorie("VOCE_CONTRATTO"))
+                importo = c[1].number_input("Importo (€)", min_value=0.0, step=50.0)
+                metodo = c[2].selectbox("Metodo", categorie("METODO"))
+                note = st.text_input("Note")
+                in_cassa = st.checkbox("Registra anche come uscita in Cassa", value=True)
+                ok = st.form_submit_button("💾 Registra", type="primary")
+            if ok:
+                if importo <= 0:
+                    st.error("Inserisci un importo maggiore di zero.")
+                else:
+                    r = t[t["id"] == tid].iloc[0]
+                    mov = ""
+                    if in_cassa:
+                        cat = VOCE_TO_USCITA.get(voce) or (
+                            "Compensi giocatori" if r["tipo"] == "Giocatore" else "Compensi staff")
+                        if cat not in categorie("USCITA"):
+                            cat = categorie("USCITA")[0]
+                        mov = registra_movimento("Uscita", dt, cat, f"{voce} {mese} – {nomi[tid]}",
+                                                 importo, metodo, "Pagamento", "", note)
+                    pid = nuovo_id("P")
+                    aggiungi("Pagamenti", {"id": pid, "data": dt.isoformat(),
+                                           "stagione": st.session_state["stagione"], "tesserato_id": tid,
+                                           "mese_rif": mese, "voce": voce, "importo": float(importo),
+                                           "metodo": metodo, "note": note,
+                                           "utente": st.session_state["utente"]["username"], "mov_id": mov})
+                    if mov:
+                        aggiorna("Movimenti", mov, {"rif_id": pid})
+                    st.success(f"✅ Pagamento di {euro(importo)} a {nomi[tid]} registrato.")
+                    st.rerun()
+
+    with tab2:
+        v = t[["nominativo", "tipo", "reparto", "compenso_stagione", "extra", "totale", "pagato", "residuo"]]
+        st.dataframe(v.rename(columns={"nominativo": "Nominativo", "tipo": "Tipo", "reparto": "Reparto",
+                                       "compenso_stagione": "Compenso", "extra": "Extra",
+                                       "totale": "Totale", "pagato": "Pagato", "residuo": "Residuo"}),
+                     hide_index=True, use_container_width=True,
+                     column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                    for k in ["Compenso", "Extra", "Totale", "Pagato", "Residuo"]})
+        c = st.columns(3)
+        kpi(c[0], "Totale contratti", euro(t["totale"].sum()))
+        kpi(c[1], "Pagato", euro(t["pagato"].sum()), tono="pos")
+        kpi(c[2], "Residuo", euro(t["residuo"].sum()), tono="gold")
+        st.write("")
+        st.download_button("⬇️ Scarica residui", to_excel({"Residui": v}), "residui.xlsx")
+
+    with tab3:
+        mese = st.selectbox("Mese", mesi, index=mesi.index(mese_corr) if mese_corr in mesi else 0,
+                            key="elenco_mese")
+        p = stagione_corrente_df("Pagamenti")
+        p = p[p["mese_rif"] == mese]
+        if p.empty:
+            st.caption("Nessun pagamento per questo mese.")
+        else:
+            p["metodo2"] = p["metodo"].apply(lambda m: "CONTANTI" if m == "Contanti" else "BONIFICO")
+            pv = p.pivot_table(index="tesserato_id", columns="metodo2", values="importo",
+                               aggfunc="sum", fill_value=0.0)
+            for col in ["BONIFICO", "CONTANTI"]:
+                if col not in pv:
+                    pv[col] = 0.0
+            pv["TOTALE"] = pv["BONIFICO"] + pv["CONTANTI"]
+            pv = pv.reset_index()
+            pv.insert(0, "GIOCATORE", pv["tesserato_id"].map(nomi))
+            pv["IBAN"] = pv["tesserato_id"].map(t.set_index("id")["iban"])
+            pv = pv[["GIOCATORE", "BONIFICO", "CONTANTI", "TOTALE", "IBAN"]]
+            tot = pd.DataFrame([{"GIOCATORE": "TOTALE", "BONIFICO": pv["BONIFICO"].sum(),
+                                 "CONTANTI": pv["CONTANTI"].sum(), "TOTALE": pv["TOTALE"].sum(), "IBAN": ""}])
+            pv = pd.concat([pv, tot], ignore_index=True)
+            st.dataframe(pv, hide_index=True, use_container_width=True,
+                         column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                        for k in ["BONIFICO", "CONTANTI", "TOTALE"]})
+            st.download_button("⬇️ Scarica elenco pagamenti", to_excel({mese: pv}),
+                               f"pagamenti_{mese.replace(' ', '_')}.xlsx")
+
+    with tab4:
+        p = stagione_corrente_df("Pagamenti")
+        if p.empty:
+            st.caption("Nessun pagamento.")
+        else:
+            p["d"] = p["data"].apply(parse_date)
+            p = p.sort_values("d", ascending=False)
+            p["Tesserato"] = p["tesserato_id"].map(nomi)
+            p["Data"] = p["data"].apply(fmt_data)
+            st.dataframe(p[["Data", "Tesserato", "mese_rif", "voce", "importo", "metodo", "note", "utente"]]
+                         .rename(columns={"mese_rif": "Mese", "voce": "Voce", "importo": "Importo",
+                                          "metodo": "Metodo", "note": "Note", "utente": "Inserito da"}),
+                         hide_index=True, use_container_width=True,
+                         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
+            if puo_modificare():
+                with st.expander("🗑️ Elimina un pagamento"):
+                    pid = st.selectbox("Pagamento", p["id"].tolist(), format_func=lambda i:
+                                       f"{p.set_index('id').loc[i, 'Data']} – {p.set_index('id').loc[i, 'Tesserato']} – "
+                                       f"{euro(p.set_index('id').loc[i, 'importo'])}")
+                    if st.button("Elimina pagamento (e relativo movimento di cassa)"):
+                        mov = p.set_index("id").loc[pid, "mov_id"]
+                        if mov:
+                            elimina("Movimenti", mov)
+                        elimina("Pagamenti", pid)
+                        st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════
+# CASSA
+# ════════════════════════════════════════════════════════════════════
+def pagina_cassa():
+    banner("Cassa", "entrate e uscite della stagione")
+    m = stagione_corrente_df("Movimenti")
+    ent = m[m["tipo"] == "Entrata"]["importo"].sum()
+    usc = m[m["tipo"] == "Uscita"]["importo"].sum()
+    segno = m.apply(lambda r: r["importo"] if r["tipo"] == "Entrata" else -r["importo"], axis=1) \
+        if len(m) else pd.Series(dtype=float)
+    contanti = segno[m["metodo"] == "Contanti"].sum() if len(m) else 0
+    c = st.columns(4)
+    kpi(c[0], "Entrate", euro(ent), tono="pos")
+    kpi(c[1], "Uscite", euro(usc), tono="neg")
+    kpi(c[2], "Saldo", euro(ent - usc), tono="pos" if ent >= usc else "neg")
+    kpi(c[3], "Saldo contanti", euro(contanti), f"banca/altro {euro(ent - usc - contanti)}", "gold")
+    st.write("")
+
+    tab1, tab2 = st.tabs(["📒 Movimenti", "➕ Nuovo movimento"])
+    with tab2:
+        if not blocca_se_sola_lettura():
+            tipo = st.radio("Tipo", ["Uscita", "Entrata"], horizontal=True, key="cassa_tipo_nuovo")
+            with st.form("mov", clear_on_submit=True):
+                c = st.columns([1, 1.4, 1, 1])
+                dt = c[0].date_input("Data", oggi(), format="DD/MM/YYYY")
+                cat = c[1].selectbox("Categoria", categorie("USCITA" if tipo == "Uscita" else "ENTRATA"))
+                imp = c[2].number_input("Importo (€)", min_value=0.0, step=10.0)
+                met = c[3].selectbox("Metodo", categorie("METODO"))
+                desc = st.text_input("Descrizione *", placeholder="es. Pranzo trasferta Cotronei")
+                note = st.text_input("Note")
+                if st.form_submit_button("💾 Registra", type="primary"):
+                    if imp <= 0 or not desc.strip():
+                        st.error("Servono descrizione e importo.")
+                    else:
+                        registra_movimento(tipo, dt, cat, desc.strip(), imp, met, note=note)
+                        st.success("Movimento registrato.")
+                        st.rerun()
+    with tab1:
+        if m.empty:
+            st.caption("Nessun movimento.")
+            return
+        m["d"] = m["data"].apply(parse_date)
+        m["Mese"] = m["d"].apply(lambda d: f"{MESI[d.month - 1]} {d.year}" if d else "")
+        c = st.columns(4)
+        f_tipo = c[0].selectbox("Tipo", ["Tutti", "Entrata", "Uscita"], key="cassa_f_tipo")
+        f_cat = c[1].selectbox("Categoria", ["Tutte"] + sorted(m["categoria"].unique().tolist()), key="cassa_f_cat")
+        f_mese = c[2].selectbox("Mese", ["Tutti"] + [x for x in mesi_stagione() if x in m["Mese"].values])
+        f_txt = c[3].text_input("🔍 Cerca")
+        v = m.copy()
+        if f_tipo != "Tutti":
+            v = v[v["tipo"] == f_tipo]
+        if f_cat != "Tutte":
+            v = v[v["categoria"] == f_cat]
+        if f_mese != "Tutti":
+            v = v[v["Mese"] == f_mese]
+        if f_txt:
+            v = v[v["descrizione"].str.contains(f_txt, case=False, na=False)]
+        v = v.sort_values("d", ascending=False)
+        v["Data"] = v["data"].apply(fmt_data)
+        v["Entrata"] = v.apply(lambda r: r["importo"] if r["tipo"] == "Entrata" else None, axis=1)
+        v["Uscita"] = v.apply(lambda r: r["importo"] if r["tipo"] == "Uscita" else None, axis=1)
+        out = v[["Data", "descrizione", "categoria", "Entrata", "Uscita", "metodo", "rif_tipo", "note"]].rename(
+            columns={"descrizione": "Descrizione", "categoria": "Categoria", "metodo": "Metodo",
+                     "rif_tipo": "Collegato a", "note": "Note"})
+        st.dataframe(out, hide_index=True, use_container_width=True,
+                     column_config={k: st.column_config.NumberColumn(format="€ %.2f") for k in ["Entrata", "Uscita"]})
+        st.caption(f"{len(v)} movimenti · entrate {euro(v['Entrata'].sum())} · uscite {euro(v['Uscita'].sum())}")
+        st.download_button("⬇️ Scarica cassa", to_excel({"Cassa": out}), "cassa.xlsx")
+        if puo_modificare():
+            with st.expander("🗑️ Elimina un movimento"):
+                mid = st.selectbox("Movimento", v["id"].tolist(), format_func=lambda i:
+                                   f"{v.set_index('id').loc[i, 'Data']} – {v.set_index('id').loc[i, 'descrizione']} – "
+                                   f"{euro(v.set_index('id').loc[i, 'importo'])}")
+                rif = v.set_index("id").loc[mid, "rif_tipo"]
+                if rif:
+                    st.warning(f"Questo movimento è collegato a un {rif}: eliminalo dalla sua sezione "
+                               f"se vuoi tenere tutto allineato.")
+                if st.button("Elimina movimento"):
+                    elimina("Movimenti", mid)
+                    st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════
+# FORNITORI & FATTURE
+# ════════════════════════════════════════════════════════════════════
+def pagina_fatture():
+    banner("Fornitori & Fatture", "cosa dobbiamo pagare")
+    forn = df("Fornitori")
+    nomi_f = forn.set_index("id")["nome"].to_dict()
+    f = stagione_corrente_df("Fatture")
+    tab1, tab2, tab3 = st.tabs(["🧾 Fatture", "➕ Nuova fattura", "🏢 Fornitori"])
+
+    with tab1:
+        if f.empty:
+            st.caption("Nessuna fattura in questa stagione.")
+        else:
+            f["residuo"] = f["importo"] - f["pagato"]
+            f["Fornitore"] = f["fornitore_id"].map(nomi_f).fillna("—")
+            f["d_scad"] = f["scadenza"].apply(parse_date)
+            c = st.columns(3)
+            kpi(c[0], "Totale fatture", euro(f["importo"].sum()))
+            kpi(c[1], "Pagato", euro(f["pagato"].sum()), tono="pos")
+            scad = f[(f["stato"] != "Pagata") & f["d_scad"].notna()]
+            scad = scad[scad["d_scad"] < oggi()]
+            kpi(c[2], "Da pagare", euro(f["residuo"].clip(lower=0).sum()),
+                f"{len(scad)} scadute", "neg" if len(scad) else "gold")
+            st.write("")
+            fs = st.selectbox("Stato", ["Aperte", "Tutte", "Pagate"])
+            v = f if fs == "Tutte" else (f[f["stato"] == "Pagata"] if fs == "Pagate" else f[f["stato"] != "Pagata"])
+            v = v.sort_values("d_scad", na_position="last")
+            out = v.assign(Data=v["data"].apply(fmt_data), Scadenza=v["scadenza"].apply(fmt_data))[
+                ["Fornitore", "numero", "Data", "Scadenza", "categoria", "descrizione", "importo", "pagato",
+                 "residuo", "stato"]].rename(columns={"numero": "N.", "categoria": "Categoria",
+                                                      "descrizione": "Descrizione", "importo": "Importo",
+                                                      "pagato": "Pagato", "residuo": "Residuo", "stato": "Stato"})
+            st.dataframe(out, hide_index=True, use_container_width=True,
+                         column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                        for k in ["Importo", "Pagato", "Residuo"]})
+            aperte = f[f["stato"] != "Pagata"]
+            if puo_modificare() and len(aperte):
+                st.markdown("##### 💳 Registra pagamento fattura")
+                with st.form("pag_fatt", clear_on_submit=True):
+                    c = st.columns([2, 1, 1, 1])
+                    fid = c[0].selectbox("Fattura", aperte["id"].tolist(), format_func=lambda i:
+                                         f"{aperte.set_index('id').loc[i, 'Fornitore']} n.{aperte.set_index('id').loc[i, 'numero']} "
+                                         f"– residuo {euro(aperte.set_index('id').loc[i, 'residuo'])}")
+                    imp = c[1].number_input("Importo (€) – 0 = saldo", min_value=0.0, step=10.0)
+                    dt = c[2].date_input("Data", oggi(), format="DD/MM/YYYY")
+                    met = c[3].selectbox("Metodo", categorie("METODO"))
+                    if st.form_submit_button("Registra pagamento", type="primary"):
+                        r = aperte.set_index("id").loc[fid]
+                        imp = imp or r["residuo"]
+                        pagato = r["pagato"] + imp
+                        stato = "Pagata" if pagato >= r["importo"] - 0.005 else "Parziale"
+                        aggiorna("Fatture", fid, {"pagato": float(pagato), "stato": stato})
+                        registra_movimento("Uscita", dt, r["categoria"],
+                                           f"Fattura n.{r['numero']} – {r['Fornitore']}", imp, met, "Fattura", fid)
+                        st.success("Pagamento registrato anche in Cassa.")
+                        st.rerun()
+            if puo_modificare():
+                with st.expander("🗑️ Elimina fattura"):
+                    did = st.selectbox("Fattura da eliminare", f["id"].tolist(), format_func=lambda i:
+                                       f"{f.set_index('id').loc[i, 'Fornitore']} n.{f.set_index('id').loc[i, 'numero']}")
+                    if st.button("Elimina fattura"):
+                        elimina("Fatture", did)
+                        st.rerun()
+
+    with tab2:
+        if not blocca_se_sola_lettura():
+            if forn.empty:
+                st.info("Aggiungi prima un fornitore nella scheda **🏢 Fornitori**.")
+            else:
+                with st.form("fatt", clear_on_submit=True):
+                    c = st.columns([2, 1, 1, 1])
+                    fid = c[0].selectbox("Fornitore", forn["id"].tolist(), format_func=lambda i: nomi_f[i])
+                    num = c[1].text_input("Numero fattura")
+                    dt = c[2].date_input("Data", oggi(), format="DD/MM/YYYY")
+                    sc = c[3].date_input("Scadenza", oggi() + timedelta(days=30), format="DD/MM/YYYY")
+                    c = st.columns([1.3, 2, 1])
+                    cu = categorie("USCITA")
+                    cat = c[0].selectbox("Categoria", cu, index=cu.index("Materiale sportivo")
+                                         if "Materiale sportivo" in cu else 0)
+                    desc = c[1].text_input("Descrizione")
+                    imp = c[2].number_input("Importo totale (€)", min_value=0.0, step=10.0)
+                    note = st.text_input("Note")
+                    gia = st.checkbox("Già pagata (registra subito in cassa)")
+                    met = st.selectbox("Metodo (se già pagata)", categorie("METODO"))
+                    if st.form_submit_button("💾 Salva fattura", type="primary"):
+                        if imp <= 0:
+                            st.error("Inserisci l'importo.")
+                        else:
+                            nid = nuovo_id("F")
+                            aggiungi("Fatture", {"id": nid, "stagione": st.session_state["stagione"],
+                                                 "fornitore_id": fid, "numero": num, "data": dt.isoformat(),
+                                                 "scadenza": sc.isoformat(), "categoria": cat, "descrizione": desc,
+                                                 "importo": float(imp), "pagato": float(imp) if gia else 0.0,
+                                                 "stato": "Pagata" if gia else "Da pagare", "note": note})
+                            if gia:
+                                registra_movimento("Uscita", dt, cat, f"Fattura n.{num} – {nomi_f[fid]}",
+                                                   imp, met, "Fattura", nid)
+                            st.success("Fattura salvata.")
+                            st.rerun()
+
+    with tab3:
+        if puo_modificare():
+            with st.form("forn", clear_on_submit=True):
+                c = st.columns([2, 1, 1])
+                nome = c[0].text_input("Ragione sociale *")
+                cat = c[1].selectbox("Categoria", categorie("FORNITORE"))
+                piva = c[2].text_input("P.IVA / C.F.")
+                c = st.columns(3)
+                tel = c[0].text_input("Telefono")
+                mail = c[1].text_input("Email")
+                iban = c[2].text_input("IBAN")
+                note = st.text_input("Note")
+                if st.form_submit_button("➕ Aggiungi fornitore"):
+                    if nome.strip():
+                        aggiungi("Fornitori", {"id": nuovo_id("FO"), "nome": nome.strip(), "categoria": cat,
+                                               "piva": piva, "telefono": tel, "email": mail,
+                                               "iban": iban.replace(" ", "").upper(), "note": note})
+                        st.rerun()
+                    else:
+                        st.error("Inserisci il nome.")
+        if len(forn):
+            tutte = df("Fatture")
+            tutte["res"] = tutte["importo"] - tutte["pagato"]
+            forn["Da pagare"] = forn["id"].map(tutte.groupby("fornitore_id")["res"].sum()).fillna(0.0)
+            st.dataframe(forn.drop(columns=["id"]).rename(columns=str.capitalize), hide_index=True,
+                         use_container_width=True,
+                         column_config={"Da pagare": st.column_config.NumberColumn(format="€ %.2f")})
+            if puo_modificare():
+                with st.expander("🗑️ Elimina fornitore"):
+                    did = st.selectbox("Fornitore", forn["id"].tolist(), format_func=lambda i: nomi_f[i])
+                    if st.button("Elimina fornitore"):
+                        elimina("Fornitori", did)
+                        st.rerun()
+        st.caption("Il fornitore è comune a tutte le stagioni. Allegati PDF: in arrivo in una prossima versione.")
+
+
+# ════════════════════════════════════════════════════════════════════
+# SPONSOR
+# ════════════════════════════════════════════════════════════════════
+def pagina_sponsor():
+    banner("Sponsor", "accordi e incassi")
+    sp = stagione_corrente_df("Sponsor")
+    m = stagione_corrente_df("Movimenti")
+    inc = m[m["rif_tipo"] == "Sponsor"].groupby("rif_id")["importo"].sum()
+    if len(sp):
+        sp["incassato"] = sp["id"].map(inc).fillna(0.0)
+        sp["da_incassare"] = sp["importo_concordato"] - sp["incassato"]
+        c = st.columns(3)
+        kpi(c[0], "Concordato", euro(sp["importo_concordato"].sum()))
+        kpi(c[1], "Incassato", euro(sp["incassato"].sum()), tono="pos")
+        kpi(c[2], "Da incassare", euro(sp["da_incassare"].clip(lower=0).sum()), tono="gold")
+        st.write("")
+        st.dataframe(sp[["nome", "referente", "telefono", "importo_concordato", "incassato", "da_incassare", "note"]]
+                     .rename(columns={"nome": "Sponsor", "referente": "Referente", "telefono": "Telefono",
+                                      "importo_concordato": "Concordato", "incassato": "Incassato",
+                                      "da_incassare": "Da incassare", "note": "Note"}),
+                     hide_index=True, use_container_width=True,
+                     column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                    for k in ["Concordato", "Incassato", "Da incassare"]})
+    else:
+        st.caption("Nessuno sponsor in questa stagione.")
+    if not puo_modificare():
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("##### ➕ Nuovo sponsor")
+        with st.form("sp", clear_on_submit=True):
+            nome = st.text_input("Nome sponsor *")
+            a, b = st.columns(2)
+            ref = a.text_input("Referente")
+            tel = b.text_input("Telefono")
+            imp = st.number_input("Importo concordato (€)", min_value=0.0, step=100.0)
+            note = st.text_input("Note (es. maglia, cartellone, social)")
+            if st.form_submit_button("Salva sponsor", type="primary") and nome.strip():
+                aggiungi("Sponsor", {"id": nuovo_id("S"), "stagione": st.session_state["stagione"],
+                                     "nome": nome.strip(), "referente": ref, "telefono": tel,
+                                     "importo_concordato": float(imp), "note": note})
+                st.rerun()
+    with c2:
+        st.markdown("##### 💶 Registra incasso")
+        if sp.empty:
+            st.caption("Aggiungi prima uno sponsor.")
+        else:
+            with st.form("inc", clear_on_submit=True):
+                sid = st.selectbox("Sponsor", sp["id"].tolist(),
+                                   format_func=lambda i: sp.set_index("id").loc[i, "nome"])
+                a, b, c = st.columns(3)
+                imp = a.number_input("Importo (€)", min_value=0.0, step=100.0)
+                dt = b.date_input("Data", oggi(), format="DD/MM/YYYY")
+                met = c.selectbox("Metodo", categorie("METODO"))
+                if st.form_submit_button("Registra incasso", type="primary") and imp > 0:
+                    cat = "Sponsor" if "Sponsor" in categorie("ENTRATA") else categorie("ENTRATA")[0]
+                    registra_movimento("Entrata", dt, cat, f"Sponsor – {sp.set_index('id').loc[sid, 'nome']}",
+                                       imp, met, "Sponsor", sid)
+                    st.rerun()
+        if len(sp):
+            with st.expander("🗑️ Elimina sponsor"):
+                did = st.selectbox("Sponsor da eliminare", sp["id"].tolist(),
+                                   format_func=lambda i: sp.set_index("id").loc[i, "nome"], key="delsp")
+                if st.button("Elimina sponsor"):
+                    elimina("Sponsor", did)
+                    st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════
+# SCADENZE
+# ════════════════════════════════════════════════════════════════════
+def pagina_scadenze():
+    banner("Scadenze", "visite mediche, tesseramenti, iscrizioni")
+    sc = stagione_corrente_df("Scadenze")
+    mt = mappa_tesserati()
+    if puo_modificare():
+        with st.expander("➕ Nuova scadenza", expanded=sc.empty):
+            with st.form("sc", clear_on_submit=True):
+                c = st.columns([1, 2, 1.5, 1])
+                tipo = c[0].selectbox("Tipo", categorie("SCADENZA"))
+                desc = c[1].text_input("Descrizione *")
+                tid = c[2].selectbox("Tesserato (facoltativo)", [""] + list(mt),
+                                     format_func=lambda i: mt.get(i, "—"))
+                dt = c[3].date_input("Scadenza", oggi() + timedelta(days=30), format="DD/MM/YYYY")
+                note = st.text_input("Note")
+                if st.form_submit_button("Salva", type="primary") and desc.strip():
+                    aggiungi("Scadenze", {"id": nuovo_id("SC"), "stagione": st.session_state["stagione"],
+                                          "tipo": tipo, "descrizione": desc.strip(), "tesserato_id": tid,
+                                          "data_scadenza": dt.isoformat(), "stato": "Da fare", "note": note})
+                    st.rerun()
+    if sc.empty:
+        st.caption("Nessuna scadenza inserita.")
+        return
+    sc["d"] = sc["data_scadenza"].apply(parse_date)
+    sc = sc.sort_values("d", na_position="last")
+
+    def semaforo(r):
+        if r["stato"] == "Fatto":
+            return "✅ Fatto"
+        if r["d"] and r["d"] < oggi():
+            return "🔴 Scaduta"
+        if r["d"] and r["d"] <= oggi() + timedelta(days=30):
+            return "🟡 Entro 30 gg"
+        return "🟢 In regola"
+    sc["Stato"] = sc.apply(semaforo, axis=1)
+    sc["Tesserato"] = sc["tesserato_id"].map(mt).fillna("")
+    sc["Data"] = sc["data_scadenza"].apply(fmt_data)
+    filtro = st.radio("Mostra", ["Da fare", "Tutte"], horizontal=True)
+    v = sc[sc["stato"] != "Fatto"] if filtro == "Da fare" else sc
+    st.dataframe(v[["Stato", "Data", "tipo", "descrizione", "Tesserato", "note"]].rename(
+        columns={"tipo": "Tipo", "descrizione": "Descrizione", "note": "Note"}),
+        hide_index=True, use_container_width=True)
+    if puo_modificare() and len(v):
+        c = st.columns([3, 1, 1])
+        sid = c[0].selectbox("Scadenza", v["id"].tolist(), format_func=lambda i:
+                             f"{v.set_index('id').loc[i, 'Data']} – {v.set_index('id').loc[i, 'descrizione']}")
+        if c[1].button("✅ Segna come fatta"):
+            aggiorna("Scadenze", sid, {"stato": "Fatto"})
+            st.rerun()
+        if c[2].button("🗑️ Elimina"):
+            elimina("Scadenze", sid)
+            st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════
+# IMPOSTAZIONI
+# ════════════════════════════════════════════════════════════════════
+def pagina_impostazioni():
+    banner("Impostazioni", "squadra, stagioni, categorie, ruoli e utenti")
+    if not puo_modificare():
+        st.info("🔒 Solo lettura.")
+        return
+    t1, t2, t3, t4, t5, t6 = st.tabs(["⚽ Squadra", "📆 Stagioni", "🏷️ Categorie", "🛡️ Ruoli", "👤 Utenti", "📜 Storico"])
+
+    with t1:
+        with st.form("squadra"):
+            c = st.columns(2)
+            nome = c[0].text_input("Nome squadra", impostazione("nome_squadra"))
+            citta = c[1].text_input("Città", impostazione("citta"))
+            c = st.columns(2)
+            c1 = c[0].color_picker("Colore sociale 1", impostazione("colore_1", "#1f7a3a"))
+            c2 = c[1].color_picker("Colore sociale 2", impostazione("colore_2", "#ffffff"))
+            if st.form_submit_button("💾 Salva", type="primary"):
+                for k, v in {"nome_squadra": nome, "citta": citta, "colore_1": c1, "colore_2": c2}.items():
+                    salva_impostazione(k, v)
+                st.rerun()
+
+    with t2:
+        s = df("Stagioni")
+        st.dataframe(s.assign(data_inizio=s["data_inizio"].apply(fmt_data),
+                              data_fine=s["data_fine"].apply(fmt_data))
+                     .rename(columns={"stagione": "Stagione", "data_inizio": "Inizio", "data_fine": "Fine",
+                                      "attiva": "Attiva"}), hide_index=True, use_container_width=True)
+        st.markdown("##### ➕ Nuova stagione")
+        ultimo = max([int(x[:4]) for x in s["stagione"] if str(x)[:4].isdigit()] or [oggi().year - 1])
+        with st.form("stg"):
+            c = st.columns(3)
+            a = c[0].number_input("Anno di inizio", value=ultimo + 1, step=1, format="%d")
+            di = c[1].date_input("Inizio", date(int(a), 7, 1), format="DD/MM/YYYY")
+            dfin = c[2].date_input("Fine", date(int(a) + 1, 6, 30), format="DD/MM/YYYY")
+            att = st.checkbox("Rendila la stagione attiva")
+            if st.form_submit_button("Crea stagione", type="primary"):
+                nome = stagione_da_anno(int(a))
+                if (s["stagione"] == nome).any():
+                    st.error("Esiste già.")
+                else:
+                    if att:
+                        for x in s["stagione"]:
+                            aggiorna("Stagioni", x, {"attiva": "NO"}, chiave_col="stagione")
+                    aggiungi("Stagioni", {"stagione": nome, "data_inizio": di.isoformat(),
+                                          "data_fine": dfin.isoformat(), "attiva": "SI" if att else "NO"})
+                    st.success(f"Stagione {nome} creata.")
+                    st.rerun()
+        if len(s) > 1:
+            c = st.columns([2, 1])
+            nuova = c[0].selectbox("Imposta stagione attiva (quella che si apre di default)", s["stagione"].tolist())
+            if c[1].button("Imposta come attiva"):
+                for x in s["stagione"]:
+                    aggiorna("Stagioni", x, {"attiva": "SI" if x == nuova else "NO"}, chiave_col="stagione")
+                st.rerun()
+
+    with t3:
+        st.caption("Tutto quello che compare nei menu a tendina si decide qui.")
+        tipo = st.selectbox("Gruppo", list(TIPI_CATEGORIA), format_func=lambda k: TIPI_CATEGORIA[k])
+        cat = df("Categorie")
+        lista = cat[cat["tipo"] == tipo]["nome"].tolist()
+        st.write(" · ".join(f"`{x}`" for x in lista) or "_vuoto: uso i valori di default_")
+        c = st.columns([2, 1])
+        nuova = c[0].text_input("Nuova voce", key=f"nv_{tipo}")
+        if c[1].button("➕ Aggiungi", key=f"add_{tipo}") and nuova.strip():
+            if nuova.strip() in lista:
+                st.warning("Esiste già.")
+            else:
+                aggiungi("Categorie", {"tipo": tipo, "nome": nuova.strip()})
+                st.rerun()
+        if lista:
+            c = st.columns([2, 1])
+            via = c[0].selectbox("Rimuovi voce", lista, key=f"rv_{tipo}")
+            if c[1].button("🗑️ Rimuovi", key=f"del_{tipo}"):
+                elimina("Categorie", via, chiave_col="nome", extra={"tipo": tipo})
+                st.rerun()
+
+    with t4:
+        r = df("Ruoli")
+        st.dataframe(r.rename(columns={"ruolo": "Ruolo", "pagine": "Pagine visibili",
+                                       "puo_modificare": "Può modificare", "vede_importi": "Vede importi"}),
+                     hide_index=True, use_container_width=True)
+        admin = impostazione("ruolo_admin", "Presidente")
+        scelta = st.selectbox("Crea o modifica ruolo", ["➕ Nuovo ruolo"] + r["ruolo"].tolist())
+        esist = r[r["ruolo"] == scelta].iloc[0].to_dict() if scelta in r["ruolo"].values else {}
+        with st.form("ruolo"):
+            nome = st.text_input("Nome ruolo (es. Segreteria, Mister, Direttore sportivo)",
+                                 esist.get("ruolo", ""), disabled=bool(esist))
+            pag = st.multiselect("Pagine che può vedere", PAGINE,
+                                 default=[p for p in str(esist.get("pagine", "Panoramica")).split(",") if p in PAGINE])
+            c = st.columns(2)
+            mod = c[0].checkbox("Può inserire / modificare", esist.get("puo_modificare", "NO") == "SI")
+            imp = c[1].checkbox("Vede gli importi (€)", esist.get("vede_importi", "NO") == "SI")
+            if st.form_submit_button("💾 Salva ruolo", type="primary"):
+                rec = {"pagine": ",".join(pag), "puo_modificare": "SI" if mod else "NO",
+                       "vede_importi": "SI" if imp else "NO"}
+                if esist:
+                    if esist["ruolo"] == admin and ("Impostazioni" not in pag or not mod):
+                        st.error(f"Il ruolo {admin} deve mantenere Impostazioni e modifica.")
+                    else:
+                        aggiorna("Ruoli", esist["ruolo"], rec, chiave_col="ruolo")
+                        st.rerun()
+                elif nome.strip() and not (r["ruolo"] == nome.strip()).any():
+                    aggiungi("Ruoli", {"ruolo": nome.strip(), **rec})
+                    st.rerun()
+                else:
+                    st.error("Nome mancante o già esistente.")
+        if esist and esist["ruolo"] != admin:
+            if st.button(f"🗑️ Elimina ruolo {esist['ruolo']}"):
+                if (df("Utenti")["ruolo"] == esist["ruolo"]).any():
+                    st.error("Ci sono utenti con questo ruolo: cambiali prima.")
+                else:
+                    elimina("Ruoli", esist["ruolo"], chiave_col="ruolo")
+                    st.rerun()
+
+    with t5:
+        u = df("Utenti")
+        st.dataframe(u[["username", "nome", "ruolo", "attivo"]].rename(columns=str.capitalize),
+                     hide_index=True, use_container_width=True)
+        ruoli = df("Ruoli")["ruolo"].tolist()
+        st.markdown("##### ➕ Nuovo utente")
+        with st.form("utente", clear_on_submit=True):
+            c = st.columns(4)
+            un = c[0].text_input("Username")
+            nm = c[1].text_input("Nome")
+            pw = c[2].text_input("Password", type="password")
+            rl = c[3].selectbox("Ruolo", ruoli)
+            if st.form_submit_button("Crea utente", type="primary"):
+                un = un.strip().lower()
+                if not un or len(pw) < 6:
+                    st.error("Username e password (min. 6) obbligatori.")
+                elif (u["username"] == un).any():
+                    st.error("Username già usato.")
+                else:
+                    aggiungi("Utenti", {"username": un, "password_hash": hash_pw(pw), "nome": nm,
+                                        "ruolo": rl, "attivo": "SI"})
+                    st.rerun()
+        st.markdown("##### ✏️ Modifica utente")
+        c = st.columns(4)
+        sel = c[0].selectbox("Utente", u["username"].tolist())
+        if sel:
+            r = u[u["username"] == sel].iloc[0]
+            nr = c[1].selectbox("Ruolo", ruoli, index=ruoli.index(r["ruolo"]) if r["ruolo"] in ruoli else 0,
+                                key="mod_ruolo")
+            npw = c[2].text_input("Nuova password (vuoto = invariata)", type="password", key="mod_pw")
+            att = c[3].selectbox("Attivo", ["SI", "NO"], index=0 if r["attivo"] == "SI" else 1, key="mod_att")
+            io_stesso = sel == st.session_state["utente"]["username"]
+            if st.button("💾 Salva utente"):
+                if io_stesso and (att == "NO" or nr != r["ruolo"]):
+                    st.error("Non puoi disattivare o cambiare il ruolo a te stesso.")
+                else:
+                    campi = {"ruolo": nr, "attivo": att}
+                    if npw:
+                        if len(npw) < 6:
+                            st.error("Password troppo corta.")
+                            st.stop()
+                        campi["password_hash"] = hash_pw(npw)
+                    aggiorna("Utenti", sel, campi, chiave_col="username")
+                    st.success("Utente aggiornato.")
+                    st.rerun()
+
+    with t6:
+        lg = df("Log")
+        st.dataframe(lg.iloc[::-1].head(300).rename(columns=str.capitalize), hide_index=True,
+                     use_container_width=True)
+        st.markdown("##### 💾 Backup")
+        st.download_button("⬇️ Scarica backup completo (Excel)",
+                           to_excel({n: df(n).drop(columns=["password_hash"], errors="ignore") for n in SHEETS}),
+                           f"backup_squadra_{oggi().isoformat()}.xlsx")
+
+
+# ════════════════════════════════════════════════════════════════════
+# AVVIO
+# ════════════════════════════════════════════════════════════════════
+def main():
+    try:
+        leggi_tutto()
+    except Exception as e:
+        applica_stile()
+        st.error("Non riesco a collegarmi al Google Sheet. Controlla i *Secrets* "
+                 "(gcp_service_account e SHEET_ID) e che il foglio sia condiviso con l'email del service account.")
+        st.exception(e)
+        st.stop()
+
+    if impostazione("setup_completato") != "SI" or df("Utenti").empty:
+        pagina_setup()
+        return
+    if "utente" not in st.session_state:
+        pagina_login()
+        return
+
+    applica_stile(impostazione("colore_1", "#1f7a3a"), impostazione("colore_2", "#ffffff"))
+    stagioni = df("Stagioni")
+    elenco = sorted(stagioni["stagione"].tolist(), reverse=True) or [stagione_da_data(oggi())]
+    attiva = stagioni[stagioni["attiva"] == "SI"]["stagione"].tolist()
+    if st.session_state.get("stagione") not in elenco:
+        st.session_state["stagione"] = attiva[0] if attiva else elenco[0]
+
+    info = ruolo_info()
+    with st.sidebar:
+        st.markdown(f"## ⚽ {impostazione('nome_squadra', 'La mia squadra')}")
+        st.selectbox("Stagione", elenco, key="stagione")
+        pagine = [p for p in PAGINE if p in info["pagine"]] or ["Panoramica"]
+        pagina = st.radio("Menu", pagine, format_func=lambda p: f"{ICONE[p]}  {p}", label_visibility="collapsed")
+        st.divider()
+        u = st.session_state["utente"]
+        st.caption(f"👤 {u['nome']} · {u['ruolo']}")
+        st.caption(f"🕒 {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}")
+        c = st.columns(2)
+        if c[0].button("🔄 Aggiorna", use_container_width=True):
+            leggi_tutto.clear()
+            st.rerun()
+        if c[1].button("🚪 Esci", use_container_width=True):
+            for k in ["utente", "stagione"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    {"Panoramica": pagina_panoramica, "Rosa & Staff": pagina_rosa, "Pagamenti": pagina_pagamenti,
+     "Cassa": pagina_cassa, "Fornitori & Fatture": pagina_fatture, "Sponsor": pagina_sponsor,
+     "Scadenze": pagina_scadenze, "Impostazioni": pagina_impostazioni}[pagina]()
+
+
+main()
