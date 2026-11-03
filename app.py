@@ -465,6 +465,46 @@ def applica_stile(c1="#1f7a3a", c2="#ffffff"):
     .pill {{ padding:2px 10px; border-radius:12px; font-size:12px; font-weight:700; }}
     .stTabs [data-baseweb="tab"] {{ font-weight:600; }}
     [data-testid="stForm"] {{ background: rgba(7,41,31,.6); border-radius:12px; }}
+    .banner:before, .banner:after {{ pointer-events:none; }}
+
+    /* ── TESTI CHIARI SULLO SFONDO VERDE ── */
+    .stApp, .stApp p, .stApp span, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+    .stApp h5, .stApp label, [data-testid="stWidgetLabel"] *, [data-testid="stMarkdownContainer"] *,
+    [data-testid="stCaptionContainer"], [data-testid="stSidebar"] * {{ color:#f5f5f0 !important; }}
+
+    /* ── CAMPI DA COMPILARE: sfondo bianco, testo scuro ── */
+    .stApp input, .stApp textarea,
+    [data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"],
+    [data-baseweb="select"] > div, [data-testid="stNumberInput"] button {{
+        background:#ffffff !important; color:#0b3d2e !important;
+        -webkit-text-fill-color:#0b3d2e !important; caret-color:#0b3d2e !important;
+        border-color:#d4af37 !important;
+    }}
+    .stApp [data-baseweb="select"] *, .stApp [data-testid="stNumberInput"] button *,
+    .stApp [data-baseweb="input"] *, .stApp [data-baseweb="base-input"] * {{
+        color:#0b3d2e !important; -webkit-text-fill-color:#0b3d2e !important; fill:#0b3d2e !important;
+    }}
+    .stApp input::placeholder, .stApp textarea::placeholder {{
+        color:#7a8a83 !important; -webkit-text-fill-color:#7a8a83 !important;
+    }}
+    /* menu a tendina e calendario */
+    [data-baseweb="popover"], [data-baseweb="menu"], [role="listbox"], [data-baseweb="calendar"] {{
+        background:#ffffff !important;
+    }}
+    [data-baseweb="popover"] *, [role="option"], [role="option"] *,
+    .stApp [data-baseweb="popover"] *, .stApp [role="option"] * {{
+        color:#0b3d2e !important; -webkit-text-fill-color:#0b3d2e !important;
+    }}
+    [role="option"]:hover, [aria-selected="true"][role="option"] {{ background:#e8f3ec !important; }}
+
+    /* ── PULSANTI ── */
+    .stButton button, [data-testid="stFormSubmitButton"] button, [data-testid="stDownloadButton"] button {{
+        background:#d4af37 !important; border:none !important; font-weight:700 !important;
+    }}
+    .stApp .stButton button *, .stApp [data-testid="stFormSubmitButton"] button *,
+    .stApp [data-testid="stDownloadButton"] button * {{
+        color:#0b3d2e !important;
+    }}
     </style>
     """, unsafe_allow_html=True)
 
