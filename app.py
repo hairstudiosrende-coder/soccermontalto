@@ -182,9 +182,23 @@ def to_excel(dfs: dict):
 # ════════════════════════════════════════════════════════════════════
 # GOOGLE SHEETS
 # ════════════════════════════════════════════════════════════════════
+def ripara_chiave(pk: str) -> str:
+    """Ricostruisce la private_key qualunque sia il formato incollato nei Secrets
+    (\\n letterali, a capo veri, spazi, virgolette, righe spezzate)."""
+    import re
+    import textwrap
+    s = str(pk).strip().strip('"').strip("'")
+    s = s.replace("\\\\n", "\n").replace("\\n", "\n").replace("\r", "")
+    corpo = re.sub(r"-----(BEGIN|END)[A-Z ]*PRIVATE KEY-----", "", s)
+    corpo = re.sub(r"[^A-Za-z0-9+/=]", "", corpo)
+    return ("-----BEGIN PRIVATE KEY-----\n" + "\n".join(textwrap.wrap(corpo, 64))
+            + "\n-----END PRIVATE KEY-----\n")
+
+
 @st.cache_resource(show_spinner=False)
 def book():
     creds = dict(st.secrets["gcp_service_account"])
+    creds["private_key"] = ripara_chiave(creds.get("private_key", ""))
     gc = gspread.service_account_from_dict(creds)
     sid = st.secrets.get("SHEET_ID", "")
     if sid.startswith("http"):
