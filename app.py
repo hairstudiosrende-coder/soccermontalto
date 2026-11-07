@@ -528,7 +528,7 @@ def _stemma_file():
 
 
 def applica_stile(c1="#1f7a3a", c2="#ffffff"):
-    st.markdown(f"""
+    css = f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;800;900&family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@500;700;800&display=swap');
     :root {{
@@ -757,8 +757,12 @@ def applica_stile(c1="#1f7a3a", c2="#ffffff"):
         .kpi .v {{ font-size:20px; }} .campo-neon {{ opacity:.35; }}
     }}
     </style>
-    {CAMPO_SVG}
-    """, unsafe_allow_html=True)
+    """
+    # una riga per regola, senza rientri né righe vuote: Streamlit lo legge sempre come stile
+    st.markdown("\n".join(r.strip() for r in css.splitlines() if r.strip()), unsafe_allow_html=True)
+    # il disegno del campo va scritto su una sola riga e senza rientri,
+    # altrimenti Streamlit lo mostra come testo invece di disegnarlo
+    st.markdown(" ".join(r.strip() for r in CAMPO_SVG.splitlines()), unsafe_allow_html=True)
 
 
 def stemma():
