@@ -36,13 +36,13 @@ SHEETS = {
                   "stato", "note"],
     "Voci_Contratto": ["id", "stagione", "tesserato_id", "voce", "importo", "note"],
     "Pagamenti": ["id", "data", "stagione", "tesserato_id", "mese_rif", "voce", "importo",
-                  "metodo", "note", "utente", "mov_id"],
+                  "metodo", "note", "utente", "mov_id", "migrato"],   # archivio: dal 2° rilascio tutto è in Movimenti
     "Fornitori": ["id", "nome", "categoria", "piva", "telefono", "email", "iban", "note"],
     "Fatture": ["id", "stagione", "fornitore_id", "numero", "data", "scadenza", "categoria",
                 "descrizione", "importo", "pagato", "stato", "note", "tesserato_id", "nel_compenso"],
     "Movimenti": ["id", "data", "stagione", "tipo", "categoria", "descrizione", "importo",
                   "metodo", "rif_tipo", "rif_id", "utente", "note", "tesserato_id", "nel_compenso",
-                  "beneficiario", "mese_rif"],
+                  "beneficiario", "mese_rif", "destinatario", "voce"],
     "Sponsor": ["id", "stagione", "nome", "referente", "telefono", "importo_concordato", "note"],
     "Scadenze": ["id", "stagione", "tipo", "descrizione", "tesserato_id", "data_scadenza",
                  "stato", "note"],
@@ -50,9 +50,11 @@ SHEETS = {
 }
 NUM_COLS = {"compenso_stagione", "importo", "pagato", "importo_concordato"}
 
-PAGINE = ["Panoramica", "Rosa & Staff", "Pagamenti", "Cassa", "Fornitori & Fatture",
+PAGINE = ["Panoramica", "Rosa & Staff", "Cassa & Pagamenti", "Fornitori & Fatture",
           "Sponsor", "Scadenze", "Impostazioni"]
-ICONE = {"Panoramica": "🏟️", "Rosa & Staff": "👥", "Pagamenti": "💶", "Cassa": "💰",
+# nomi di pagina delle versioni precedenti (ruoli già salvati nel foglio)
+PAGINE_ALIAS = {"Pagamenti": "Cassa & Pagamenti", "Cassa": "Cassa & Pagamenti"}
+ICONE = {"Panoramica": "🏟️", "Rosa & Staff": "👥", "Cassa & Pagamenti": "💰",
          "Fornitori & Fatture": "🧾", "Sponsor": "🤝", "Scadenze": "📅", "Impostazioni": "⚙️"}
 
 # Tipi di categoria (tutte modificabili da Impostazioni → Categorie)
@@ -381,6 +383,27 @@ def aggiorna(nome, valore, campi: dict, chiave_col="id"):
     return True
 
 
+def aggiorna_molti(nome, modifiche: dict, chiave_col="id"):
+    """{valore_chiave: {campo: valore}} → 1 lettura + 1 scrittura per tutte le righe."""
+    if not modifiche:
+        return
+    ws = worksheets()[nome]
+    header = intestazione(nome)
+    colonna = ws.col_values(header.index(chiave_col) + 1)
+    riga_di = {str(v).strip(): i for i, v in enumerate(colonna, start=1) if i > 1}
+    blocchi = []
+    for chiave, campi in modifiche.items():
+        r = riga_di.get(str(chiave).strip())
+        if r is None:
+            continue
+        blocchi += [{"range": gspread.utils.rowcol_to_a1(r, header.index(k) + 1),
+                     "values": [["" if v is None else v]]} for k, v in campi.items() if k in header]
+    if blocchi:
+        ws.batch_update(blocchi, value_input_option="RAW")
+    scrivi_log("Modificato in blocco", nome, f"{len(modifiche)} righe")
+    leggi_tutto.clear()
+
+
 def elimina(nome, valore, chiave_col="id", extra=None):
     r = _trova_riga(nome, chiave_col, valore, extra)
     if r is None:
@@ -437,7 +460,11 @@ def ruolo_info():
     if not len(r):
         return {"pagine": ["Panoramica"], "modifica": False, "importi": False}
     r = r.iloc[0]
-    pagine = [p.strip() for p in str(r["pagine"]).split(",") if p.strip() in PAGINE]
+    pagine = []
+    for p in str(r["pagine"]).split(","):
+        p = PAGINE_ALIAS.get(p.strip(), p.strip())
+        if p in PAGINE and p not in pagine:
+            pagine.append(p)
     return {"pagine": pagine,
             "modifica": str(r["puo_modificare"]).upper() == "SI",
             "importi": str(r["vede_importi"]).upper() == "SI"}
@@ -685,11 +712,22 @@ def nome_completo(r):
     return f"{r['cognome']} {r['nome']}".strip()
 
 
-def spese_per_tesserati():
-    """Uscite di cassa pagate a strutture/terzi per conto di un tesserato
-    (alloggio, visite, terapie…), esclusi i pagamenti diretti al tesserato."""
+def movimenti_tesserati():
+    """Uscite collegate a un tesserato (registro unico Movimenti)."""
     m = stagione_corrente_df("Movimenti")
-    return m[(m["tipo"] == "Uscita") & (m["tesserato_id"] != "") & (m["rif_tipo"] != "Pagamento")].copy()
+    return m[(m["tipo"] == "Uscita") & (m["tesserato_id"] != "")].copy()
+
+
+def pagamenti_diretti():
+    """Soldi dati direttamente al giocatore/staff (bonifico, contanti…)."""
+    m = movimenti_tesserati()
+    return m[m["destinatario"] == "Giocatore"].copy()
+
+
+def spese_per_tesserati():
+    """Pagamenti a strutture/terzi per conto di un tesserato (alloggio, visite, terapie…)."""
+    m = movimenti_tesserati()
+    return m[m["destinatario"] != "Giocatore"].copy()
 
 
 def tesserati_con_saldi():
@@ -698,10 +736,9 @@ def tesserati_con_saldi():
         return t.assign(extra=0.0, totale=0.0, pagato_diretto=0.0, pagato_terzi=0.0, pagato=0.0,
                         residuo=0.0, spese_extra=0.0, costo_totale=0.0, nominativo="")
     v = stagione_corrente_df("Voci_Contratto")
-    p = stagione_corrente_df("Pagamenti")
     sp = spese_per_tesserati()
     extra = v.groupby("tesserato_id")["importo"].sum()
-    pag = p.groupby("tesserato_id")["importo"].sum()
+    pag = pagamenti_diretti().groupby("tesserato_id")["importo"].sum()
     terzi = sp[sp["nel_compenso"] == "SI"].groupby("tesserato_id")["importo"].sum()
     fuori = sp[sp["nel_compenso"] != "SI"].groupby("tesserato_id")["importo"].sum()
     t["extra"] = t["id"].map(extra).fillna(0.0)
@@ -729,7 +766,12 @@ def mappa_tesserati():
 
 def registra_movimento(tipo, data_mov, categoria, descrizione, importo, metodo,
                        rif_tipo="", rif_id="", note="", tesserato_id="", nel_compenso="",
-                       beneficiario="", mese_rif=""):
+                       beneficiario="", mese_rif="", destinatario="", voce=""):
+    """UNICO punto in cui si registrano soldi in entrata/uscita."""
+    if tesserato_id and not destinatario:
+        destinatario = "Struttura"
+    if destinatario == "Giocatore":
+        nel_compenso = "SI"
     mid = nuovo_id("M")
     aggiungi("Movimenti", {
         "id": mid, "data": data_mov.isoformat(), "stagione": st.session_state["stagione"],
@@ -737,8 +779,40 @@ def registra_movimento(tipo, data_mov, categoria, descrizione, importo, metodo,
         "importo": float(importo), "metodo": metodo, "rif_tipo": rif_tipo, "rif_id": rif_id,
         "utente": st.session_state["utente"]["username"], "note": note,
         "tesserato_id": tesserato_id, "nel_compenso": nel_compenso if tesserato_id else "",
-        "beneficiario": beneficiario, "mese_rif": mese_rif})
+        "beneficiario": beneficiario, "mese_rif": mese_rif,
+        "destinatario": destinatario if tesserato_id else "", "voce": voce})
     return mid
+
+
+def migra_dati():
+    """Una sola volta: porta i vecchi Pagamenti nel registro unico Movimenti."""
+    if impostazione("versione_dati") == "2":
+        return
+    pag = df("Pagamenti")
+    mov = df("Movimenti")
+    ids_mov = set(mov["id"])
+    nuovi = []
+    with st.spinner("Aggiorno i dati al nuovo registro unico…"):
+        mod_mov, mod_pag = {}, {}
+        for _, p in pag[pag["migrato"] != "SI"].iterrows():
+            campi = {"tesserato_id": p["tesserato_id"], "destinatario": "Giocatore", "nel_compenso": "SI",
+                     "voce": p["voce"], "mese_rif": p["mese_rif"], "rif_tipo": "", "rif_id": ""}
+            if p["mov_id"] and p["mov_id"] in ids_mov:
+                mod_mov[p["mov_id"]] = campi
+            else:
+                nuovi.append({"id": nuovo_id("M"), "data": p["data"], "stagione": p["stagione"],
+                              "tipo": "Uscita", "categoria": "Compensi giocatori",
+                              "descrizione": f"{p['voce']} {p['mese_rif']}", "importo": p["importo"],
+                              "metodo": p["metodo"], "utente": p["utente"], "note": p["note"], **campi})
+            mod_pag[p["id"]] = {"migrato": "SI"}
+        # vecchie spese a strutture: tesserato presente ma destinatario vuoto
+        for _, m in mov.iterrows():
+            if m["tesserato_id"] and not m["destinatario"] and m["id"] not in mod_mov:
+                mod_mov[m["id"]] = {"destinatario": "Struttura"}
+        aggiorna_molti("Movimenti", mod_mov)
+        aggiungi_molti("Movimenti", nuovi)
+        aggiorna_molti("Pagamenti", mod_pag)
+        salva_impostazione("versione_dati", "2")
 
 
 SCELTE_COMPENSO = ["NO – spesa extra a carico della società",
@@ -801,7 +875,8 @@ def pagina_setup():
                                        "attivo": "SI"}])
             gia = set(df("Impostazioni")["chiave"])
             imp = {"nome_squadra": nome.strip(), "citta": citta.strip(), "colore_1": col1,
-                   "colore_2": col2, "ruolo_admin": "Presidente", "setup_completato": "SI"}
+                   "colore_2": col2, "ruolo_admin": "Presidente", "versione_dati": "2",
+                   "setup_completato": "SI"}
             for k in [k for k in imp if k in gia]:
                 aggiorna("Impostazioni", k, {"valore": imp.pop(k)}, chiave_col="chiave")
             aggiungi_molti("Impostazioni", [{"chiave": k, "valore": v} for k, v in imp.items()])
@@ -1088,13 +1163,12 @@ def pagina_rosa():
                             aggiungi("Tesserati", nuovo)
                             st.success(f"Confermato per la stagione {dest}.")
                 with st.expander("🗑️ Elimina tesserato"):
-                    st.warning("Elimina anche voci contratto e pagamenti collegati (i movimenti di cassa restano).")
+                    st.warning("Elimina il tesserato e le sue voci contratto. I movimenti di cassa già "
+                               "registrati restano (i soldi sono usciti davvero) ma senza nome collegato.")
                     if st.checkbox("Confermo l'eliminazione", key=f"ck_{sel}") and \
                             st.button("Elimina definitivamente", key=f"del_{sel}"):
                         for vid in stagione_corrente_df("Voci_Contratto").query("tesserato_id == @sel")["id"]:
                             elimina("Voci_Contratto", vid)
-                        for pid in stagione_corrente_df("Pagamenti").query("tesserato_id == @sel")["id"]:
-                            elimina("Pagamenti", pid)
                         elimina("Tesserati", sel)
                         st.rerun()
             else:
@@ -1156,7 +1230,8 @@ def pagina_rosa():
             if not imp:
                 st.info("🔒 Il tuo ruolo non vede gli importi.")
             else:
-                p = stagione_corrente_df("Pagamenti")
+                st.markdown("#### 💶 Pagati direttamente a lui")
+                p = pagamenti_diretti()
                 p = p[p["tesserato_id"] == sel].copy()
                 if p.empty:
                     st.caption("Nessun pagamento registrato.")
@@ -1187,7 +1262,7 @@ def pagina_rosa():
                     kpi(c[1], "Strutture extra", euro(sp[sp["nel_compenso"] != "SI"]["importo"].sum()),
                         "fuori contratto", "neg")
                     kpi(c[2], "Totale strutture", euro(sp["importo"].sum()), tono="gold")
-                    st.caption("Per cambiare la scelta compenso: Pagamenti → 🏨 Pagati a strutture.")
+                    st.caption("Per cambiare la scelta compenso: Cassa & Pagamenti → 🏨 Pagati a strutture.")
                 st.markdown("#### 🧮 Totale speso per lui in questa stagione")
                 c = st.columns(3)
                 kpi(c[0], "Pagato al giocatore", euro(r["pagato_diretto"]), tono="pos")
@@ -1196,138 +1271,268 @@ def pagina_rosa():
 
 
 # ════════════════════════════════════════════════════════════════════
-# PAGAMENTI
+# CASSA & PAGAMENTI  (registro unico: foglio Movimenti)
 # ════════════════════════════════════════════════════════════════════
-def pagina_pagamenti():
-    banner("Pagamenti", "compensi a giocatori e staff")
-    t = tesserati_con_saldi()
-    if t.empty:
-        st.info("Prima inserisci i tesserati in **Rosa & Staff**.")
+TIPI_REGISTRAZIONE = ["💶 Pagamento a giocatore / staff", "🏨 Pagamento a struttura per un giocatore",
+                      "📤 Altra uscita", "📥 Entrata"]
+
+
+def pagina_cassa_pagamenti():
+    banner("Cassa & Pagamenti", "un solo registro per tutti i soldi della stagione")
+    m = stagione_corrente_df("Movimenti")
+    ent = m[m["tipo"] == "Entrata"]["importo"].sum()
+    usc = m[m["tipo"] == "Uscita"]["importo"].sum()
+    segno = m["importo"].where(m["tipo"] == "Entrata", -m["importo"]) if len(m) else pd.Series(dtype=float)
+    contanti = segno[m["metodo"] == "Contanti"].sum() if len(m) else 0.0
+    if vede_importi():
+        c = st.columns(4)
+        kpi(c[0], "Entrate", euro(ent), tono="pos")
+        kpi(c[1], "Uscite", euro(usc), tono="neg")
+        kpi(c[2], "Saldo", euro(ent - usc), tono="pos" if ent >= usc else "neg")
+        kpi(c[3], "Saldo contanti", euro(contanti), f"banca/altro {euro(ent - usc - contanti)}", "gold")
+        st.write("")
+    else:
+        st.info("🔒 Il tuo ruolo non vede gli importi.")
         return
-    t = ordina_reparti(t)
-    nomi = t.set_index("id")["nominativo"].to_dict()
+
+    t = ordina_reparti(tesserati_con_saldi())
+    nomi = t.set_index("id")["nominativo"].to_dict() if len(t) else {}
     mesi = mesi_stagione()
     mese_corr = f"{MESI[oggi().month - 1]} {oggi().year}"
-    tab1, tab_s, tab2, tab_t, tab3, tab4 = st.tabs(["➕ Registra pagamento", "🏨 Pagati a strutture", "📊 Residui",
-                                                    "🧮 Totale per giocatore", "🗓️ Elenco del mese", "📜 Storico"])
-
-    with tab1:
-        if not blocca_se_sola_lettura():
-            with st.form("pag", clear_on_submit=True):
-                c = st.columns([2, 1, 1])
-                tid = c[0].selectbox("Tesserato", t["id"].tolist(), format_func=lambda i: nomi[i])
-                mese = c[1].selectbox("Mese di riferimento", mesi,
-                                      index=mesi.index(mese_corr) if mese_corr in mesi else 0)
-                dt = c[2].date_input("Data pagamento", oggi(), format="DD/MM/YYYY")
-                c = st.columns([1, 1, 1])
-                voce = c[0].selectbox("Voce", categorie("VOCE_CONTRATTO"))
-                importo = c[1].number_input("Importo (€)", min_value=0.0, step=50.0)
-                metodo = c[2].selectbox("Metodo", categorie("METODO"))
-                note = st.text_input("Note")
-                in_cassa = st.checkbox("Registra anche come uscita in Cassa", value=True)
-                ok = st.form_submit_button("💾 Registra", type="primary")
-            if ok:
-                if importo <= 0:
-                    st.error("Inserisci un importo maggiore di zero.")
-                else:
-                    r = t[t["id"] == tid].iloc[0]
-                    mov = ""
-                    if in_cassa:
-                        cat = VOCE_TO_USCITA.get(voce) or (
-                            "Compensi giocatori" if r["tipo"] == "Giocatore" else "Compensi staff")
-                        if cat not in categorie("USCITA"):
-                            cat = categorie("USCITA")[0]
-                        mov = registra_movimento("Uscita", dt, cat, f"{voce} {mese} – {nomi[tid]}",
-                                                 importo, metodo, "Pagamento", "", note)
-                    pid = nuovo_id("P")
-                    aggiungi("Pagamenti", {"id": pid, "data": dt.isoformat(),
-                                           "stagione": st.session_state["stagione"], "tesserato_id": tid,
-                                           "mese_rif": mese, "voce": voce, "importo": float(importo),
-                                           "metodo": metodo, "note": note,
-                                           "utente": st.session_state["utente"]["username"], "mov_id": mov})
-                    if mov:
-                        aggiorna("Movimenti", mov, {"rif_id": pid})
-                    avviso(f"✅ Pagamento di {euro(importo)} a {nomi[tid]} registrato.")
-                    st.rerun()
-
-    with tab_s:
-        sezione_pagati_strutture(t, nomi, mesi, mese_corr)
-
-    with tab2:
-        colonne = {"nominativo": "Nominativo", "tipo": "Tipo", "reparto": "Reparto",
-                   "compenso_stagione": "Compenso", "extra": "Extra", "totale": "Totale contratto",
-                   "pagato_diretto": "Pagato al giocatore", "pagato_terzi": "Pagato a strutture (nel compenso)",
-                   "residuo": "Residuo", "spese_extra": "Spese extra società", "costo_totale": "Costo totale"}
-        v = t[list(colonne)].rename(columns=colonne)
-        st.dataframe(v, hide_index=True, width="stretch",
-                     column_config={k: st.column_config.NumberColumn(format="€ %.2f")
-                                    for k in list(colonne.values())[3:]})
-        st.caption("**Residuo** = totale contratto − pagato al giocatore − pagato a strutture *nel compenso*. "
-                   "Le **spese extra** non toccano il residuo ma entrano nel **costo totale** del giocatore.")
-        c = st.columns(4)
-        kpi(c[0], "Totale contratti", euro(t["totale"].sum()))
-        kpi(c[1], "Pagato (diretto + strutture)", euro(t["pagato"].sum()), tono="pos")
-        kpi(c[2], "Residuo", euro(t["residuo"].sum()), tono="gold")
-        kpi(c[3], "Spese extra società", euro(t["spese_extra"].sum()), "fuori compenso", "neg")
-        st.write("")
-        st.download_button("⬇️ Scarica residui", to_excel({"Residui": v}), "residui.xlsx")
-
-    with tab_t:
+    schede = st.tabs(["➕ Registra", "📒 Movimenti", "📊 Residui giocatori", "🏨 Pagati a strutture",
+                      "🧮 Totale per giocatore", "🗓️ Elenco del mese"])
+    with schede[0]:
+        sezione_registra(t, nomi, mesi, mese_corr)
+    with schede[1]:
+        sezione_movimenti(m, nomi)
+    with schede[2]:
+        sezione_residui(t)
+    with schede[3]:
+        sezione_pagati_strutture(nomi)
+    with schede[4]:
         sezione_totale_per_giocatore(t)
+    with schede[5]:
+        sezione_elenco_mese(t, nomi, mesi, mese_corr)
 
-    with tab3:
-        mese = st.selectbox("Mese", mesi, index=mesi.index(mese_corr) if mese_corr in mesi else 0,
-                            key="elenco_mese")
-        p = stagione_corrente_df("Pagamenti")
-        p = p[p["mese_rif"] == mese]
-        if p.empty:
-            st.caption("Nessun pagamento per questo mese.")
-        else:
-            p["metodo2"] = p["metodo"].apply(lambda m: "CONTANTI" if m == "Contanti" else "BONIFICO")
-            pv = p.pivot_table(index="tesserato_id", columns="metodo2", values="importo",
-                               aggfunc="sum", fill_value=0.0)
-            for col in ["BONIFICO", "CONTANTI"]:
-                if col not in pv:
-                    pv[col] = 0.0
-            pv["TOTALE"] = pv["BONIFICO"] + pv["CONTANTI"]
-            pv = pv.reset_index()
-            pv.insert(0, "GIOCATORE", pv["tesserato_id"].map(nomi))
-            pv["IBAN"] = pv["tesserato_id"].map(t.set_index("id")["iban"])
-            pv = pv[["GIOCATORE", "BONIFICO", "CONTANTI", "TOTALE", "IBAN"]]
-            tot = pd.DataFrame([{"GIOCATORE": "TOTALE", "BONIFICO": pv["BONIFICO"].sum(),
-                                 "CONTANTI": pv["CONTANTI"].sum(), "TOTALE": pv["TOTALE"].sum(), "IBAN": ""}])
-            pv = pd.concat([pv, tot], ignore_index=True)
-            st.dataframe(pv, hide_index=True, width="stretch",
-                         column_config={k: st.column_config.NumberColumn(format="€ %.2f")
-                                        for k in ["BONIFICO", "CONTANTI", "TOTALE"]})
-            st.download_button("⬇️ Scarica elenco pagamenti", to_excel({mese: pv}),
-                               f"pagamenti_{mese.replace(' ', '_')}.xlsx")
 
-    with tab4:
-        p = stagione_corrente_df("Pagamenti")
-        if p.empty:
-            st.caption("Nessun pagamento.")
-        else:
-            p["d"] = p["data"].apply(parse_date)
-            p = p.sort_values("d", ascending=False)
-            p["Tesserato"] = p["tesserato_id"].map(nomi)
-            p["Data"] = p["data"].apply(fmt_data)
-            st.dataframe(p[["Data", "Tesserato", "mese_rif", "voce", "importo", "metodo", "note", "utente"]]
-                         .rename(columns={"mese_rif": "Mese", "voce": "Voce", "importo": "Importo",
-                                          "metodo": "Metodo", "note": "Note", "utente": "Inserito da"}),
-                         hide_index=True, width="stretch",
-                         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
-            if puo_modificare():
-                with st.expander("🗑️ Elimina un pagamento"):
-                    pid = st.selectbox("Pagamento", p["id"].tolist(), format_func=lambda i:
-                                       f"{p.set_index('id').loc[i, 'Data']} – {p.set_index('id').loc[i, 'Tesserato']} – "
-                                       f"{euro(p.set_index('id').loc[i, 'importo'])}")
-                    if st.button("Elimina pagamento (e relativo movimento di cassa)"):
-                        mov = p.set_index("id").loc[pid, "mov_id"]
-                        if mov:
-                            elimina("Movimenti", mov)
-                        elimina("Pagamenti", pid)
-                        st.rerun()
+def _indice(lista, valore):
+    return lista.index(valore) if valore in lista else 0
+
+
+def sezione_registra(t, nomi, mesi, mese_corr):
+    if blocca_se_sola_lettura():
+        return
+    cosa = st.radio("Cosa vuoi registrare?", TIPI_REGISTRAZIONE, horizontal=True, key="reg_cosa")
+    usc, ent, met = categorie("USCITA"), categorie("ENTRATA"), categorie("METODO")
+    ids = t["id"].tolist() if len(t) else []
+    if cosa in TIPI_REGISTRAZIONE[:2] and not ids:
+        st.info("Prima inserisci i tesserati in **Rosa & Staff**.")
+        return
+
+    # ── 1. pagamento diretto al giocatore ──
+    if cosa == TIPI_REGISTRAZIONE[0]:
+        st.caption("Soldi dati **direttamente** al giocatore o allo staff (bonifico, contanti…): "
+                   "scalano dal suo compenso e finiscono nell'**Elenco del mese**.")
+        with st.form("reg_gioc", clear_on_submit=True):
+            c = st.columns([2, 1, 1])
+            tid = c[0].selectbox("Tesserato", ids, format_func=lambda i: nomi[i])
+            mese = c[1].selectbox("Mese di riferimento", mesi, index=_indice(mesi, mese_corr))
+            dt = c[2].date_input("Data pagamento", oggi(), format="DD/MM/YYYY")
+            c = st.columns(3)
+            voce = c[0].selectbox("Voce", categorie("VOCE_CONTRATTO"))
+            imp = c[1].number_input("Importo (€)", min_value=0.0, step=50.0)
+            metodo = c[2].selectbox("Metodo", met)
+            note = st.text_input("Note")
+            ok = st.form_submit_button("💾 Registra pagamento", type="primary")
+        if ok:
+            if imp <= 0:
+                st.error("Inserisci un importo maggiore di zero.")
+                return
+            r = t[t["id"] == tid].iloc[0]
+            cat = VOCE_TO_USCITA.get(voce) or ("Compensi giocatori" if r["tipo"] == "Giocatore"
+                                               else "Compensi staff")
+            if cat not in usc:
+                cat = usc[0]
+            registra_movimento("Uscita", dt, cat, f"{voce} {mese} – {nomi[tid]}", imp, metodo, note=note,
+                               tesserato_id=tid, destinatario="Giocatore", mese_rif=mese, voce=voce,
+                               beneficiario=nomi[tid])
+            avviso(f"✅ Pagamento di {euro(imp)} a {nomi[tid]} registrato.")
+            st.rerun()
+
+    # ── 2. pagamento a struttura per un giocatore ──
+    elif cosa == TIPI_REGISTRAZIONE[1]:
+        st.caption("Alloggio, visita medica, terapia… pagati **direttamente alla struttura** per un giocatore. "
+                   "Scegli se l'importo **scala dal suo compenso** o è una **spesa extra della società**.")
+        forn = df("Fornitori")
+        with st.form("reg_strutt", clear_on_submit=True):
+            c = st.columns([2, 2, 1])
+            tid = c[0].selectbox("Giocatore / tesserato che ne ha usufruito", ids, format_func=lambda i: nomi[i])
+            fsel = c[1].selectbox("Struttura (dai fornitori)", [""] + forn["nome"].tolist(),
+                                  format_func=lambda x: x or "— scrivi a destra se non è in elenco —")
+            altro = c[2].text_input("…oppure nome struttura")
+            c = st.columns([1.4, 1, 1, 1])
+            cat = c[0].selectbox("Tipo di spesa", usc, index=_indice(usc, "Alloggi"))
+            imp = c[1].number_input("Importo (€)", min_value=0.0, step=10.0)
+            dt = c[2].date_input("Data", oggi(), format="DD/MM/YYYY")
+            metodo = c[3].selectbox("Metodo", met)
+            c = st.columns([1, 2])
+            mese = c[0].selectbox("Mese di riferimento", mesi, index=_indice(mesi, mese_corr))
+            desc = c[1].text_input("Descrizione", placeholder="es. Hotel settembre, visita ortopedica, 5 sedute fisioterapia")
+            compenso = st.radio("Va nel compenso del giocatore?", SCELTE_COMPENSO, horizontal=True)
+            note = st.text_input("Note")
+            ok = st.form_submit_button("💾 Registra pagamento alla struttura", type="primary")
+        if ok:
+            struttura = (altro.strip() or fsel).strip()
+            if imp <= 0 or not struttura:
+                st.error("Servono la struttura e un importo maggiore di zero.")
+                return
+            nc = scelta_compenso(compenso)
+            registra_movimento("Uscita", dt, cat, f"{desc.strip() or cat} – {struttura} (per {nomi[tid]})",
+                               imp, metodo, note=note, tesserato_id=tid, nel_compenso=nc,
+                               destinatario="Struttura", beneficiario=struttura, mese_rif=mese)
+            avviso(f"✅ {euro(imp)} a {struttura} per {nomi[tid]} – "
+                   f"{'scalato dal compenso' if nc == 'SI' else 'spesa extra società'}.")
+            st.rerun()
+
+    # ── 3/4. altra uscita o entrata ──
+    else:
+        uscita = cosa == TIPI_REGISTRAZIONE[2]
+        with st.form("reg_mov", clear_on_submit=True):
+            c = st.columns([1, 1.4, 1, 1])
+            dt = c[0].date_input("Data", oggi(), format="DD/MM/YYYY")
+            cat = c[1].selectbox("Categoria", usc if uscita else ent)
+            imp = c[2].number_input("Importo (€)", min_value=0.0, step=10.0)
+            metodo = c[3].selectbox("Metodo", met)
+            desc = st.text_input("Descrizione *", placeholder="es. Pranzo trasferta Cotronei" if uscita
+                                 else "es. Contributo Comune")
+            note = st.text_input("Note")
+            ok = st.form_submit_button("💾 Registra", type="primary")
+        if ok:
+            if imp <= 0 or not desc.strip():
+                st.error("Servono descrizione e importo.")
+                return
+            registra_movimento("Uscita" if uscita else "Entrata", dt, cat, desc.strip(), imp, metodo, note=note)
+            avviso("✅ Movimento registrato.")
+            st.rerun()
+
+
+def _annulla_pagamento_fattura(mov):
+    """Se elimino il pagamento di una fattura, la fattura torna (in parte) da pagare."""
+    f = df("Fatture")
+    r = f[f["id"] == mov["rif_id"]]
+    if len(r):
+        r = r.iloc[0]
+        pagato = max(r["pagato"] - mov["importo"], 0.0)
+        stato = "Pagata" if pagato >= r["importo"] - 0.005 else ("Parziale" if pagato > 0 else "Da pagare")
+        aggiorna("Fatture", r["id"], {"pagato": float(pagato), "stato": stato})
+
+
+def sezione_movimenti(m, nomi):
+    if m.empty:
+        st.caption("Nessun movimento.")
+        return
+    m = m.copy()
+    m["d"] = m["data"].apply(parse_date)
+    m["Mese"] = m["d"].apply(lambda d: f"{MESI[d.month - 1]} {d.year}" if d else "")
+    m["Giocatore"] = m["tesserato_id"].map(nomi).fillna("")
+    c = st.columns([1, 1.3, 1, 1.3, 1.4])
+    f_tipo = c[0].selectbox("Tipo", ["Tutti", "Entrata", "Uscita"], key="mv_tipo")
+    f_cat = c[1].selectbox("Categoria", ["Tutte"] + sorted(m["categoria"].unique().tolist()), key="mv_cat")
+    f_mese = c[2].selectbox("Mese", ["Tutti"] + [x for x in mesi_stagione() if x in m["Mese"].values], key="mv_mese")
+    gioc = sorted([g for g in m["Giocatore"].unique() if g])
+    f_gioc = c[3].selectbox("Giocatore", ["Tutti"] + gioc, key="mv_gioc")
+    f_txt = c[4].text_input("🔍 Cerca", key="mv_txt")
+    v = m
+    if f_tipo != "Tutti":
+        v = v[v["tipo"] == f_tipo]
+    if f_cat != "Tutte":
+        v = v[v["categoria"] == f_cat]
+    if f_mese != "Tutti":
+        v = v[v["Mese"] == f_mese]
+    if f_gioc != "Tutti":
+        v = v[v["Giocatore"] == f_gioc]
+    if f_txt:
+        v = v[v["descrizione"].str.contains(f_txt, case=False, na=False)]
+    v = v.sort_values("d", ascending=False).copy()
+    v["Data"] = v["data"].apply(fmt_data)
+    v["Entrata"] = v["importo"].where(v["tipo"] == "Entrata")
+    v["Uscita"] = v["importo"].where(v["tipo"] == "Uscita")
+    v["A chi"] = v.apply(lambda r: "👤 Giocatore" if r["destinatario"] == "Giocatore" else
+                         (f"🏨 {r['beneficiario']}" if r["destinatario"] == "Struttura" else
+                          (r["beneficiario"] or "")), axis=1)
+    v["Nel compenso"] = v.apply(lambda r: "" if not r["tesserato_id"] else
+                                ("✅ Sì" if r["nel_compenso"] == "SI" else "➖ No"), axis=1)
+    out = v[["Data", "descrizione", "categoria", "Entrata", "Uscita", "metodo", "Giocatore", "A chi",
+             "Nel compenso", "note"]].rename(columns={"descrizione": "Descrizione", "categoria": "Categoria",
+                                                       "metodo": "Metodo", "note": "Note"})
+    st.dataframe(out, hide_index=True, width="stretch",
+                 column_config={k: st.column_config.NumberColumn(format="€ %.2f") for k in ["Entrata", "Uscita"]})
+    st.caption(f"{len(v)} movimenti · entrate {euro(v['Entrata'].sum())} · uscite {euro(v['Uscita'].sum())}")
+    st.download_button("⬇️ Scarica movimenti (Excel)", to_excel({"Movimenti": out}), "movimenti.xlsx")
+    if puo_modificare() and len(v):
+        with st.expander("🗑️ Elimina un movimento"):
+            mid = st.selectbox("Movimento", v["id"].tolist(), key="mv_del", format_func=lambda i:
+                               f"{v.set_index('id').loc[i, 'Data']} – {v.set_index('id').loc[i, 'descrizione']} – "
+                               f"{euro(v.set_index('id').loc[i, 'importo'])}")
+            mv = v.set_index("id").loc[mid]
+            if mv["rif_tipo"] == "Fattura":
+                st.caption("È il pagamento di una fattura: eliminandolo la fattura torna da pagare per questo importo.")
+            if st.checkbox("Confermo l'eliminazione", key="mv_ck") and st.button("Elimina movimento", key="mv_btn"):
+                if mv["rif_tipo"] == "Fattura":
+                    _annulla_pagamento_fattura(mv)
+                elimina("Movimenti", mid)
+                avviso("🗑️ Movimento eliminato.")
+                st.rerun()
+
+
+def sezione_residui(t):
+    if t.empty:
+        st.caption("Nessun tesserato.")
+        return
+    colonne = {"nominativo": "Nominativo", "tipo": "Tipo", "reparto": "Reparto",
+               "compenso_stagione": "Compenso", "extra": "Extra", "totale": "Totale contratto",
+               "pagato_diretto": "Pagato al giocatore", "pagato_terzi": "Pagato a strutture (nel compenso)",
+               "residuo": "Residuo", "spese_extra": "Spese extra società", "costo_totale": "Costo totale"}
+    v = t[list(colonne)].rename(columns=colonne)
+    st.dataframe(v, hide_index=True, width="stretch",
+                 column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                for k in list(colonne.values())[3:]})
+    st.caption("**Residuo** = totale contratto − pagato al giocatore − pagato a strutture *nel compenso*. "
+               "Le **spese extra** non toccano il residuo ma entrano nel **costo totale** del giocatore.")
+    c = st.columns(4)
+    kpi(c[0], "Totale contratti", euro(t["totale"].sum()))
+    kpi(c[1], "Pagato (diretto + strutture)", euro(t["pagato"].sum()), tono="pos")
+    kpi(c[2], "Residuo", euro(t["residuo"].sum()), tono="gold")
+    kpi(c[3], "Spese extra società", euro(t["spese_extra"].sum()), "fuori compenso", "neg")
+    st.write("")
+    st.download_button("⬇️ Scarica residui", to_excel({"Residui": v}), "residui.xlsx")
+
+
+def sezione_elenco_mese(t, nomi, mesi, mese_corr):
+    mese = st.selectbox("Mese", mesi, index=_indice(mesi, mese_corr), key="elenco_mese")
+    p = pagamenti_diretti()
+    p = p[p["mese_rif"] == mese].copy()
+    if p.empty:
+        st.caption("Nessun pagamento diretto ai tesserati per questo mese.")
+        return
+    p["metodo2"] = p["metodo"].apply(lambda x: "CONTANTI" if x == "Contanti" else "BONIFICO")
+    pv = p.pivot_table(index="tesserato_id", columns="metodo2", values="importo", aggfunc="sum", fill_value=0.0)
+    for col in ["BONIFICO", "CONTANTI"]:
+        if col not in pv:
+            pv[col] = 0.0
+    pv["TOTALE"] = pv["BONIFICO"] + pv["CONTANTI"]
+    pv = pv.reset_index()
+    pv.insert(0, "GIOCATORE", pv["tesserato_id"].map(nomi).fillna("—"))
+    pv["IBAN"] = pv["tesserato_id"].map(t.set_index("id")["iban"] if len(t) else {}).fillna("")
+    pv = pv[["GIOCATORE", "BONIFICO", "CONTANTI", "TOTALE", "IBAN"]]
+    tot = pd.DataFrame([{"GIOCATORE": "TOTALE", "BONIFICO": pv["BONIFICO"].sum(),
+                         "CONTANTI": pv["CONTANTI"].sum(), "TOTALE": pv["TOTALE"].sum(), "IBAN": ""}])
+    pv = pd.concat([pv, tot], ignore_index=True)
+    st.dataframe(pv, hide_index=True, width="stretch",
+                 column_config={k: st.column_config.NumberColumn(format="€ %.2f")
+                                for k in ["BONIFICO", "CONTANTI", "TOTALE"]})
+    st.download_button("⬇️ Scarica elenco pagamenti", to_excel({mese: pv}),
+                       f"pagamenti_{mese.replace(' ', '_')}.xlsx")
 
 
 def sezione_totale_per_giocatore(t):
@@ -1393,48 +1598,9 @@ def sezione_totale_per_giocatore(t):
                        f"totale_per_giocatore_{st.session_state['stagione'].replace('/', '-')}.xlsx")
 
 
-def sezione_pagati_strutture(t, nomi, mesi, mese_corr):
-    """Pagamenti fatti direttamente a una struttura (albergo, centro medico, fisioterapista…)
-    per conto di un tesserato: si sceglie se scalarli dal compenso oppure no."""
-    st.caption("Per alloggi, visite mediche, terapie… pagati **direttamente alla struttura** per un giocatore. "
-               "Scegli se l'importo **scala dal suo compenso** o è una **spesa extra della società**.")
-    forn = df("Fornitori")
-    usc = categorie("USCITA")
-    if puo_modificare():
-        with st.form("strutt", clear_on_submit=True):
-            c = st.columns([2, 2, 1])
-            tid = c[0].selectbox("Giocatore / tesserato che ne ha usufruito", t["id"].tolist(),
-                                 format_func=lambda i: nomi[i])
-            nomi_forn = [""] + forn["nome"].tolist()
-            fsel = c[1].selectbox("Struttura (dai fornitori)", nomi_forn,
-                                  format_func=lambda x: x or "— scrivi a destra se non è in elenco —")
-            altro = c[2].text_input("…oppure nome struttura")
-            c = st.columns([1.4, 1, 1, 1])
-            cat = c[0].selectbox("Tipo di spesa", usc, index=usc.index("Alloggi") if "Alloggi" in usc else 0)
-            imp = c[1].number_input("Importo (€)", min_value=0.0, step=10.0)
-            dt = c[2].date_input("Data", oggi(), format="DD/MM/YYYY")
-            met = c[3].selectbox("Metodo", categorie("METODO"))
-            c = st.columns([1, 2])
-            mese = c[0].selectbox("Mese di riferimento", mesi,
-                                  index=mesi.index(mese_corr) if mese_corr in mesi else 0)
-            desc = c[1].text_input("Descrizione", placeholder="es. Hotel settembre, visita ortopedica, 5 sedute fisioterapia")
-            compenso = st.radio("Va nel compenso del giocatore?", SCELTE_COMPENSO, horizontal=True)
-            note = st.text_input("Note")
-            ok = st.form_submit_button("💾 Registra pagamento alla struttura", type="primary")
-        if ok:
-            struttura = (altro.strip() or fsel).strip()
-            if imp <= 0 or not struttura:
-                st.error("Servono la struttura e un importo maggiore di zero.")
-            else:
-                nc = scelta_compenso(compenso)
-                registra_movimento("Uscita", dt, cat,
-                                   f"{desc.strip() or cat} – {struttura} (per {nomi[tid]})",
-                                   imp, met, note=note, tesserato_id=tid, nel_compenso=nc,
-                                   beneficiario=struttura, mese_rif=mese)
-                avviso(f"✅ {euro(imp)} a {struttura} per {nomi[tid]} – "
-                       f"{'scalato dal compenso' if nc == 'SI' else 'spesa extra società'}.")
-                st.rerun()
-
+def sezione_pagati_strutture(nomi):
+    st.caption("Alloggi, visite, terapie… pagati alle strutture per conto dei giocatori. "
+               "Per registrarne uno nuovo: **➕ Registra → 🏨 Pagamento a struttura**.")
     sp = spese_per_tesserati()
     if sp.empty:
         st.caption("Nessun pagamento a strutture registrato.")
@@ -1452,117 +1618,24 @@ def sezione_pagati_strutture(t, nomi, mesi, mese_corr):
                  "importo": "Importo", "metodo": "Metodo", "mese_rif": "Mese"}),
         hide_index=True, width="stretch",
         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
-    c = st.columns(2)
+    c = st.columns(3)
     kpi(c[0], "Nel compenso", euro(v[v["nel_compenso"] == "SI"]["importo"].sum()), "scala dal residuo", "gold")
     kpi(c[1], "Spese extra società", euro(v[v["nel_compenso"] != "SI"]["importo"].sum()), "fuori compenso", "neg")
+    kpi(c[2], "Totale strutture", euro(v["importo"].sum()))
     if puo_modificare():
         st.write("")
-        with st.expander("🔁 Cambia scelta compenso / elimina"):
+        with st.expander("🔁 Cambia scelta compenso"):
             mid = st.selectbox("Pagamento", v["id"].tolist(), key="sel_strutt", format_func=lambda i:
                                f"{v.set_index('id').loc[i, 'Data']} – {v.set_index('id').loc[i, 'Giocatore']} – "
                                f"{v.set_index('id').loc[i, 'beneficiario']} – {euro(v.set_index('id').loc[i, 'importo'])}")
             attuale = v.set_index("id").loc[mid, "nel_compenso"]
-            c = st.columns(2)
             etichetta = ("➖ Togli dal compenso (diventa spesa extra)" if attuale == "SI"
                          else "✅ Metti nel compenso (scala dal residuo)")
-            if c[0].button(etichetta, key="toggle_strutt"):
+            if st.button(etichetta, key="toggle_strutt"):
                 aggiorna("Movimenti", mid, {"nel_compenso": "NO" if attuale == "SI" else "SI"})
                 avviso("✅ Scelta aggiornata.")
                 st.rerun()
-            if c[1].button("🗑️ Elimina pagamento", key="del_strutt"):
-                elimina("Movimenti", mid)
-                st.rerun()
-
-
-# ════════════════════════════════════════════════════════════════════
-# CASSA
-# ════════════════════════════════════════════════════════════════════
-def pagina_cassa():
-    banner("Cassa", "entrate e uscite della stagione")
-    m = stagione_corrente_df("Movimenti")
-    ent = m[m["tipo"] == "Entrata"]["importo"].sum()
-    usc = m[m["tipo"] == "Uscita"]["importo"].sum()
-    segno = m.apply(lambda r: r["importo"] if r["tipo"] == "Entrata" else -r["importo"], axis=1) \
-        if len(m) else pd.Series(dtype=float)
-    contanti = segno[m["metodo"] == "Contanti"].sum() if len(m) else 0
-    c = st.columns(4)
-    kpi(c[0], "Entrate", euro(ent), tono="pos")
-    kpi(c[1], "Uscite", euro(usc), tono="neg")
-    kpi(c[2], "Saldo", euro(ent - usc), tono="pos" if ent >= usc else "neg")
-    kpi(c[3], "Saldo contanti", euro(contanti), f"banca/altro {euro(ent - usc - contanti)}", "gold")
-    st.write("")
-
-    tab1, tab2 = st.tabs(["📒 Movimenti", "➕ Nuovo movimento"])
-    with tab2:
-        if not blocca_se_sola_lettura():
-            tipo = st.radio("Tipo", ["Uscita", "Entrata"], horizontal=True, key="cassa_tipo_nuovo")
-            with st.form("mov", clear_on_submit=True):
-                c = st.columns([1, 1.4, 1, 1])
-                dt = c[0].date_input("Data", oggi(), format="DD/MM/YYYY")
-                cat = c[1].selectbox("Categoria", categorie("USCITA" if tipo == "Uscita" else "ENTRATA"))
-                imp = c[2].number_input("Importo (€)", min_value=0.0, step=10.0)
-                met = c[3].selectbox("Metodo", categorie("METODO"))
-                desc = st.text_input("Descrizione *", placeholder="es. Pranzo trasferta Cotronei")
-                note = st.text_input("Note")
-                tid, compenso = "", SCELTE_COMPENSO[0]
-                if tipo == "Uscita":
-                    mt = mappa_tesserati()
-                    c = st.columns([1, 1.6])
-                    tid = c[0].selectbox("Giocatore di riferimento (facoltativo)", [""] + list(mt),
-                                         format_func=lambda i: mt.get(i, "— nessuno —"), key="cassa_tess")
-                    compenso = c[1].radio("Se c'è un giocatore: va nel suo compenso?", SCELTE_COMPENSO,
-                                          key="cassa_comp")
-                if st.form_submit_button("💾 Registra", type="primary"):
-                    if imp <= 0 or not desc.strip():
-                        st.error("Servono descrizione e importo.")
-                    else:
-                        registra_movimento(tipo, dt, cat, desc.strip(), imp, met, note=note,
-                                           tesserato_id=tid, nel_compenso=scelta_compenso(compenso))
-                        avviso("Movimento registrato.")
-                        st.rerun()
-    with tab1:
-        if m.empty:
-            st.caption("Nessun movimento.")
-            return
-        m["d"] = m["data"].apply(parse_date)
-        m["Mese"] = m["d"].apply(lambda d: f"{MESI[d.month - 1]} {d.year}" if d else "")
-        c = st.columns(4)
-        f_tipo = c[0].selectbox("Tipo", ["Tutti", "Entrata", "Uscita"], key="cassa_f_tipo")
-        f_cat = c[1].selectbox("Categoria", ["Tutte"] + sorted(m["categoria"].unique().tolist()), key="cassa_f_cat")
-        f_mese = c[2].selectbox("Mese", ["Tutti"] + [x for x in mesi_stagione() if x in m["Mese"].values])
-        f_txt = c[3].text_input("🔍 Cerca")
-        v = m.copy()
-        if f_tipo != "Tutti":
-            v = v[v["tipo"] == f_tipo]
-        if f_cat != "Tutte":
-            v = v[v["categoria"] == f_cat]
-        if f_mese != "Tutti":
-            v = v[v["Mese"] == f_mese]
-        if f_txt:
-            v = v[v["descrizione"].str.contains(f_txt, case=False, na=False)]
-        v = v.sort_values("d", ascending=False)
-        v["Data"] = v["data"].apply(fmt_data)
-        v["Entrata"] = v.apply(lambda r: r["importo"] if r["tipo"] == "Entrata" else None, axis=1)
-        v["Uscita"] = v.apply(lambda r: r["importo"] if r["tipo"] == "Uscita" else None, axis=1)
-        out = v[["Data", "descrizione", "categoria", "Entrata", "Uscita", "metodo", "rif_tipo", "note"]].rename(
-            columns={"descrizione": "Descrizione", "categoria": "Categoria", "metodo": "Metodo",
-                     "rif_tipo": "Collegato a", "note": "Note"})
-        st.dataframe(out, hide_index=True, width="stretch",
-                     column_config={k: st.column_config.NumberColumn(format="€ %.2f") for k in ["Entrata", "Uscita"]})
-        st.caption(f"{len(v)} movimenti · entrate {euro(v['Entrata'].sum())} · uscite {euro(v['Uscita'].sum())}")
-        st.download_button("⬇️ Scarica cassa", to_excel({"Cassa": out}), "cassa.xlsx")
-        if puo_modificare():
-            with st.expander("🗑️ Elimina un movimento"):
-                mid = st.selectbox("Movimento", v["id"].tolist(), format_func=lambda i:
-                                   f"{v.set_index('id').loc[i, 'Data']} – {v.set_index('id').loc[i, 'descrizione']} – "
-                                   f"{euro(v.set_index('id').loc[i, 'importo'])}")
-                rif = v.set_index("id").loc[mid, "rif_tipo"]
-                if rif:
-                    st.warning(f"Questo movimento è collegato a un {rif}: eliminalo dalla sua sezione "
-                               f"se vuoi tenere tutto allineato.")
-                if st.button("Elimina movimento"):
-                    elimina("Movimenti", mid)
-                    st.rerun()
+            st.caption("Per eliminarlo: scheda **📒 Movimenti → Elimina un movimento**.")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2028,6 +2101,7 @@ def main():
     if impostazione("setup_completato") != "SI" or df("Utenti").empty:
         pagina_setup()
         return
+    migra_dati()
     if "utente" not in st.session_state:
         pagina_login()
         return
@@ -2061,8 +2135,8 @@ def main():
                 st.session_state.pop(k, None)
             st.rerun()
 
-    {"Panoramica": pagina_panoramica, "Rosa & Staff": pagina_rosa, "Pagamenti": pagina_pagamenti,
-     "Cassa": pagina_cassa, "Fornitori & Fatture": pagina_fatture, "Sponsor": pagina_sponsor,
+    {"Panoramica": pagina_panoramica, "Rosa & Staff": pagina_rosa, "Cassa & Pagamenti": pagina_cassa_pagamenti,
+     "Fornitori & Fatture": pagina_fatture, "Sponsor": pagina_sponsor,
      "Scadenze": pagina_scadenze, "Impostazioni": pagina_impostazioni}[pagina]()
 
 
