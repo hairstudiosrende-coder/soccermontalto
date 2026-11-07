@@ -492,165 +492,272 @@ def _chiaro(hex_col):
     return (0.299 * r + 0.587 * g + 0.114 * b) > 160
 
 
+# Palette "campo da calcio futuristico"
+NEON, CIANO, ORO, ROSSO = "#3dffa0", "#2ee6ff", "#ffd166", "#ff5d73"
+TESTO, TENUE = "#e9fff4", "rgba(233,255,244,.62)"
+
+# Linee del campo al neon (sfondo fisso dietro a tutto)
+CAMPO_SVG = """<div class="campo-neon"><svg viewBox="0 0 1440 900" preserveAspectRatio="none">
+<defs><filter id="glw"><feGaussianBlur stdDeviation="3" result="b"/>
+<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+<g stroke="#3dffa0" stroke-opacity=".2" fill="none" stroke-width="2" filter="url(#glw)">
+<rect x="40" y="40" width="1360" height="820" rx="6"/><line x1="720" y1="40" x2="720" y2="860"/>
+<circle cx="720" cy="450" r="125"/><circle cx="720" cy="450" r="4" fill="#3dffa0"/>
+<rect x="40" y="250" width="170" height="400"/><rect x="40" y="350" width="64" height="200"/>
+<rect x="1230" y="250" width="170" height="400"/><rect x="1336" y="350" width="64" height="200"/>
+<path d="M210 382 A 92 92 0 0 1 210 518"/><path d="M1230 382 A 92 92 0 0 0 1230 518"/>
+</g></svg></div>"""
+
+
+@st.cache_data(show_spinner=False)
+def _stemma_file():
+    """Se nel repository c'è stemma.png (o .jpg/.svg/.webp) lo usa al posto dello scudo."""
+    import base64
+    from pathlib import Path
+    try:
+        cartella = Path(__file__).resolve().parent
+    except NameError:
+        cartella = Path.cwd()
+    tipi = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".svg": "image/svg+xml", ".webp": "image/webp"}
+    for est, mime in tipi.items():
+        f = cartella / f"stemma{est}"
+        if f.exists():
+            return f"data:{mime};base64,{base64.b64encode(f.read_bytes()).decode()}"
+    return ""
+
+
 def applica_stile(c1="#1f7a3a", c2="#ffffff"):
-    txt1 = "#0b3d2e" if _chiaro(c1) else "#ffffff"
     st.markdown(f"""
     <style>
-    :root {{ --c1:{c1}; --c2:{c2}; --txt1:{txt1}; --oro:#d4af37; --prato:#0b3d2e;
-             --scuro:#07291f; --chiaro:#f5f5f0; --bordo:rgba(255,255,255,.16); }}
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;800;900&family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@500;700;800&display=swap');
+    :root {{
+        --c1:{c1}; --c2:{c2};
+        --neon:{NEON}; --ciano:{CIANO}; --oro:{ORO}; --rosso:{ROSSO};
+        --bg:#03110d; --vetro:rgba(8,36,27,.62); --vetro2:rgba(3,20,14,.78);
+        --bordo:rgba(61,255,160,.2); --testo:{TESTO}; --tenue:{TENUE};
+        --f-titolo:'Orbitron','Rajdhani',system-ui,sans-serif;
+        --f-testo:'Rajdhani','Inter',system-ui,sans-serif;
+        --f-num:'JetBrains Mono','DejaVu Sans Mono',ui-monospace,monospace;
+    }}
 
-    /* ── SFONDO: strisce del prato ── */
+    /* ── SFONDO: notte allo stadio + strisce del prato ── */
     .stApp {{
         background:
-          radial-gradient(ellipse at top, rgba(255,255,255,.06), transparent 60%),
-          repeating-linear-gradient(90deg, #0b3d2e 0 90px, #0d4434 90px 180px);
+          radial-gradient(900px 520px at 12% -8%, rgba(46,230,255,.16), transparent 60%),
+          radial-gradient(900px 520px at 92% -8%, rgba(61,255,160,.15), transparent 60%),
+          repeating-linear-gradient(90deg, rgba(4,26,16,.9) 0 110px, rgba(3,17,13,0) 110px 220px),
+          linear-gradient(180deg, #041a12 0%, #020c08 100%) !important;
+        background-attachment: fixed !important;
     }}
-    [data-testid="stHeader"] {{ background:transparent; }}
-    .block-container {{ padding-top:2.2rem; max-width:1300px; }}
+    .campo-neon {{ position:fixed; inset:0; pointer-events:none; z-index:0; opacity:.6; }}
+    .campo-neon svg {{ width:100%; height:100%; }}
+    [data-testid="stHeader"] {{ background:transparent !important; }}
+    .block-container {{ padding-top:2rem; max-width:1320px; position:relative; z-index:1; }}
 
-    /* ── TESTI CHIARI ── */
-    .stApp, .stApp p, .stApp span, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
-    .stApp h5, .stApp label, [data-testid="stWidgetLabel"] *, [data-testid="stMarkdownContainer"] *,
-    [data-testid="stCaptionContainer"], [data-testid="stSidebar"] * {{ color:var(--chiaro) !important; }}
-    .stApp h4 {{ border-left:4px solid var(--oro); padding-left:10px; margin-top:18px; }}
-    .stApp h3 {{ font-weight:800; }}
+    /* ── TESTI ── */
+    .stApp, .stApp p, .stApp span, .stApp li, .stApp label, .stApp h1, .stApp h2, .stApp h3,
+    .stApp h4, .stApp h5, [data-testid="stWidgetLabel"] *, [data-testid="stMarkdownContainer"] *,
+    [data-testid="stCaptionContainer"], [data-testid="stSidebar"] * {{ color:var(--testo) !important; }}
+    .stApp {{ font-family:var(--f-testo); font-size:16.5px; }}
+    [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * {{ color:var(--tenue) !important; }}
+    [data-testid="stWidgetLabel"] p {{ font-size:12px !important; letter-spacing:1.6px; text-transform:uppercase;
+        font-weight:700 !important; color:var(--tenue) !important; }}
+    .stApp h3 {{ font-family:var(--f-testo); font-weight:700; letter-spacing:2.5px; text-transform:uppercase;
+        font-size:17px !important; }}
+    .stApp h4 {{ font-family:var(--f-testo); font-weight:700; letter-spacing:2.2px; text-transform:uppercase;
+        font-size:15px !important; margin-top:18px; display:flex; align-items:center; gap:10px; }}
+    .stApp h4:before {{ content:""; width:9px; height:9px; border-radius:2px; background:var(--neon);
+        box-shadow:0 0 10px var(--neon); flex:0 0 9px; }}
+    .stApp h5 {{ font-family:var(--f-testo); letter-spacing:1.5px; text-transform:uppercase; font-size:14px !important; }}
 
     /* ── BARRA LATERALE ── */
     [data-testid="stSidebar"] > div:first-child {{
-        background: linear-gradient(180deg, var(--scuro) 0%, #0b3d2e 100%);
-        border-right: 2px solid var(--bordo);
+        background:linear-gradient(180deg, rgba(3,20,14,.96), rgba(3,20,14,.86)) !important;
+        border-right:1px solid var(--bordo); backdrop-filter:blur(10px);
     }}
-    .stemma {{ display:flex; align-items:center; gap:12px; margin:4px 0 16px; }}
-    .stemma .scudo {{
-        width:54px; height:62px; flex:0 0 54px; display:flex; align-items:center; justify-content:center;
-        background:linear-gradient(90deg, var(--c1) 50%, var(--c2) 50%);
-        clip-path:polygon(50% 100%, 0 72%, 0 0, 100% 0, 100% 72%);
-        font-weight:900; font-size:18px; letter-spacing:.5px;
-        box-shadow:0 0 0 3px var(--oro) inset;
+    .stemma {{ display:flex; align-items:center; gap:14px; margin:2px 0 18px; }}
+    .stemma .scudo {{ width:58px; height:66px; flex:0 0 58px; position:relative;
+        filter:drop-shadow(0 0 10px rgba(61,255,160,.55)); }}
+    .stemma .scudo .b, .stemma .scudo .s {{ position:absolute;
+        clip-path:polygon(50% 100%, 0 74%, 0 0, 100% 0, 100% 74%); }}
+    .stemma .scudo .b {{ inset:0; background:var(--neon); }}
+    .stemma .scudo .s {{ inset:2px; background:linear-gradient(90deg, var(--c1) 50%, var(--c2) 50%); }}
+    .stemma .scudo span {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+        padding-bottom:10px; font-family:var(--f-titolo); font-weight:900; font-size:14px; letter-spacing:.5px;
+        color:#03110d !important; text-shadow:0 0 6px #fff; }}
+    .stemma img {{ width:62px; height:62px; object-fit:contain; flex:0 0 62px;
+        filter:drop-shadow(0 0 10px rgba(61,255,160,.5)); }}
+    .stemma .nome {{ font-family:var(--f-testo); font-weight:700; font-size:19px; line-height:1.05; }}
+    .stemma .citta {{ font-size:11px; letter-spacing:2.6px; text-transform:uppercase; color:var(--tenue) !important;
+        margin-top:4px; }}
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {{
+        background:rgba(61,255,160,.07) !important; border:1px solid var(--bordo) !important;
     }}
-    .stemma .scudo span {{ color:var(--oro) !important; text-shadow:0 1px 2px #000; }}
-    .stemma .nome {{ font-weight:800; font-size:17px; line-height:1.15; }}
-    .stemma .citta {{ font-size:12px; opacity:.7; }}
-
-    /* menu: niente pallini, voci a pulsante */
+    [data-testid="stSidebar"] [data-baseweb="select"] * {{
+        color:var(--neon) !important; -webkit-text-fill-color:var(--neon) !important; fill:var(--neon) !important;
+        font-family:var(--f-num) !important; font-weight:700 !important;
+    }}
+    /* menu a pulsanti illuminati */
     [data-testid="stSidebar"] [role="radiogroup"] {{ gap:4px; }}
     [data-testid="stSidebar"] [role="radiogroup"] label {{
-        width:100%; padding:9px 12px; border-radius:10px; margin:0;
-        border:1px solid transparent; transition:all .15s;
-    }}
-    [data-testid="stSidebar"] [role="radiogroup"] label:hover {{
-        background:rgba(255,255,255,.07); border-color:var(--bordo);
+        width:100%; padding:10px 14px; border-radius:12px; margin:0; border:1px solid transparent;
+        transition:all .15s;
     }}
     [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {{ display:none; }}
+    [data-testid="stSidebar"] [role="radiogroup"] label p {{ font-size:16px !important; font-weight:600 !important;
+        color:var(--tenue) !important; }}
+    [data-testid="stSidebar"] [role="radiogroup"] label:hover {{ background:rgba(61,255,160,.07);
+        border-color:var(--bordo); }}
     [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {{
-        background:var(--oro); border-color:var(--oro);
+        background:linear-gradient(90deg, var(--neon), #9dffcf); box-shadow:0 0 22px rgba(61,255,160,.45);
     }}
-    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) * {{
-        color:var(--prato) !important; font-weight:800;
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p {{
+        color:#03110d !important; font-weight:800 !important;
     }}
+    [data-testid="stSidebar"] hr {{ border-color:var(--bordo) !important; }}
 
-    /* ── TITOLO PAGINA (campo da calcio) ── */
+    /* ── INTESTAZIONE PAGINA ── */
     .banner {{
-        position:relative; overflow:hidden; border-radius:18px; padding:24px 28px;
-        background: linear-gradient(120deg, var(--c1) 0%, #0b3d2e 70%);
-        border:2px solid rgba(255,255,255,.55); margin-bottom:20px;
-        box-shadow:0 10px 30px rgba(0,0,0,.25);
+        position:relative; overflow:hidden; border-radius:22px; padding:24px 30px 22px; margin-bottom:22px;
+        background:linear-gradient(115deg, color-mix(in srgb, var(--c1) 60%, transparent), rgba(4,26,18,.7) 62%);
+        border:1px solid rgba(61,255,160,.38);
+        box-shadow:0 0 0 1px rgba(46,230,255,.08) inset, 0 20px 50px rgba(0,0,0,.35);
     }}
-    .banner:before {{ content:""; position:absolute; top:0; bottom:0; left:66%;
-        border-left:2px solid rgba(255,255,255,.22); pointer-events:none; }}
-    .banner:after {{ content:""; position:absolute; width:150px; height:150px; border-radius:50%;
-        border:2px solid rgba(255,255,255,.22); left:calc(66% - 75px); top:calc(50% - 75px);
+    .banner:before {{ content:""; position:absolute; right:78px; top:0; bottom:0;
+        border-left:2px solid rgba(61,255,160,.25); pointer-events:none; }}
+    .banner:after {{ content:""; position:absolute; right:-56px; top:-56px; width:250px; height:250px;
+        border-radius:50%; border:2px solid rgba(61,255,160,.35); box-shadow:0 0 30px rgba(61,255,160,.22);
         pointer-events:none; }}
-    .banner .t {{ font-size:30px; font-weight:900; line-height:1.1; position:relative; z-index:1; }}
-    .banner .t, .banner .t * {{ color:var(--txt1) !important; }}
-    .banner .s {{ font-size:15px; opacity:.9; margin-top:6px; position:relative; z-index:1; }}
-    .banner .badge {{
-        display:inline-block; margin-top:12px; padding:4px 14px; border-radius:20px;
-        background:var(--oro); font-weight:800; font-size:13px; position:relative; z-index:1;
-    }}
-    .banner .badge, .banner .badge * {{ color:var(--prato) !important; }}
+    .banner .k {{ font-size:12px; letter-spacing:4px; text-transform:uppercase; font-weight:700;
+        color:var(--neon) !important; }}
+    .banner .t {{ font-family:var(--f-titolo); font-size:34px; font-weight:900; letter-spacing:1.5px;
+        text-transform:uppercase; margin-top:6px; line-height:1.1; position:relative; z-index:1; }}
+    .banner .s {{ color:var(--tenue) !important; font-size:16px; margin-top:4px; position:relative; z-index:1; }}
+    .banner .dx {{ position:absolute; right:112px; top:26px; text-align:right; z-index:1; }}
+    .banner .chip {{ display:inline-block; padding:7px 16px; border-radius:30px; font-weight:800; font-size:13px;
+        letter-spacing:1.2px; background:var(--oro); box-shadow:0 0 20px rgba(255,209,102,.5);
+        font-family:var(--f-num); }}
+    .banner .chip, .banner .chip * {{ color:#03110d !important; }}
+    .banner .live {{ font-size:12px; color:var(--tenue) !important; letter-spacing:1px; margin-top:10px; }}
+    .banner .live i {{ display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--neon);
+        box-shadow:0 0 8px var(--neon); margin-right:6px; }}
 
     /* ── CARD NUMERI ── */
     .kpi {{
-        background: linear-gradient(160deg, rgba(7,41,31,.95), rgba(13,68,52,.85));
-        border:1px solid var(--bordo); border-top:4px solid var(--c1);
-        border-radius:14px; padding:14px 16px; height:100%; min-height:96px;
-        box-shadow:0 6px 18px rgba(0,0,0,.2); transition:transform .15s;
+        position:relative; overflow:hidden; border-radius:18px; padding:15px 18px 14px; height:100%;
+        min-height:104px; background:var(--vetro); border:1px solid var(--bordo); backdrop-filter:blur(8px);
+        transition:transform .15s, box-shadow .15s;
     }}
-    .kpi:hover {{ transform:translateY(-2px); }}
-    .kpi .l {{ font-size:11.5px; text-transform:uppercase; letter-spacing:.9px; opacity:.75; }}
-    .kpi .v {{ font-size:25px; font-weight:900; margin-top:4px; white-space:nowrap; }}
-    .kpi .n {{ font-size:12px; opacity:.7; margin-top:2px; }}
-    .kpi.pos {{ border-top-color:#4caf50; }} .kpi.pos .v {{ color:#7CFC9A !important; }}
-    .kpi.neg {{ border-top-color:#e57373; }} .kpi.neg .v {{ color:#ff8a80 !important; }}
-    .kpi.gold {{ border-top-color:var(--oro); }} .kpi.gold .v {{ color:var(--oro) !important; }}
-    .pill {{ padding:2px 10px; border-radius:12px; font-size:12px; font-weight:800; }}
-    .pill, .pill * {{ color:var(--prato) !important; }}
+    .kpi:hover {{ transform:translateY(-2px); box-shadow:0 10px 28px rgba(0,0,0,.35); }}
+    .kpi:before {{ content:""; position:absolute; left:0; right:0; top:0; height:3px;
+        background:linear-gradient(90deg, var(--neon), transparent); }}
+    .kpi .l {{ font-size:11.5px; letter-spacing:2.2px; text-transform:uppercase; font-weight:700;
+        color:var(--tenue) !important; }}
+    .kpi .v {{ font-family:var(--f-num); font-size:25px; font-weight:800; margin-top:8px; letter-spacing:-.5px;
+        white-space:nowrap; }}
+    .kpi .n {{ font-size:13px; color:var(--tenue) !important; margin-top:3px; }}
+    .kpi.pos .v {{ color:var(--neon) !important; text-shadow:0 0 12px rgba(61,255,160,.5); }}
+    .kpi.neg:before {{ background:linear-gradient(90deg, var(--rosso), transparent); }}
+    .kpi.neg .v {{ color:var(--rosso) !important; text-shadow:0 0 12px rgba(255,93,115,.45); }}
+    .kpi.gold:before {{ background:linear-gradient(90deg, var(--oro), transparent); }}
+    .kpi.gold .v {{ color:var(--oro) !important; text-shadow:0 0 12px rgba(255,209,102,.45); }}
+    .kpi.ciano:before {{ background:linear-gradient(90deg, var(--ciano), transparent); }}
+    .kpi.ciano .v {{ color:var(--ciano) !important; text-shadow:0 0 12px rgba(46,230,255,.45); }}
+    /* tabellone tipo risultato partita */
+    .kpi.score {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }}
+    .kpi.score .t {{ text-align:center; }}
+    .kpi.score .v {{ font-size:23px; }}
+    .kpi.score .vs {{ font-family:var(--f-titolo); font-weight:900; font-size:12px; letter-spacing:3px;
+        color:var(--tenue) !important; border:1px solid var(--bordo); border-radius:8px; padding:6px 9px; }}
+    .pill {{ font-family:var(--f-num); font-size:12px; font-weight:800; padding:4px 9px; border-radius:8px; }}
+    .pill, .pill * {{ color:#03110d !important; }}
+    .scad {{ display:flex; align-items:center; gap:12px; padding:10px 14px; border-radius:14px; margin-bottom:8px;
+        background:var(--vetro2); border:1px solid var(--bordo); }}
 
-    /* ── SCHEDE, MODULI, RIQUADRI ── */
-    .stTabs [data-baseweb="tab-list"] {{ gap:6px; border-bottom:1px solid var(--bordo); }}
+    /* ── SCHEDE ── */
+    .stTabs [data-baseweb="tab-list"] {{ gap:8px; border-bottom:none !important; flex-wrap:wrap; }}
     .stTabs [data-baseweb="tab"] {{
-        background:rgba(7,41,31,.6); border-radius:10px 10px 0 0; padding:8px 16px; font-weight:700;
+        background:var(--vetro2) !important; border:1px solid var(--bordo) !important; border-radius:12px !important;
+        padding:8px 16px !important; height:auto !important;
     }}
-    .stTabs [aria-selected="true"] {{ background:var(--oro) !important; }}
-    .stTabs [aria-selected="true"] * {{ color:var(--prato) !important; }}
-    .stTabs [data-baseweb="tab-highlight"] {{ background:var(--oro) !important; }}
-    [data-testid="stForm"] {{
-        background: rgba(7,41,31,.72); border:1px solid var(--bordo) !important; border-radius:14px;
-    }}
-    [data-testid="stExpander"] details {{
-        background: rgba(7,41,31,.6); border:1px solid var(--bordo) !important; border-radius:12px;
-    }}
-    [data-testid="stAlert"] {{ background:rgba(7,41,31,.85) !important; border-radius:12px; }}
-    [data-testid="stDataFrame"] {{ border:1px solid var(--bordo); border-radius:10px; overflow:hidden; }}
+    .stTabs [data-baseweb="tab"] p {{ font-weight:700 !important; font-size:15px !important; color:var(--tenue) !important; }}
+    .stTabs [aria-selected="true"] {{ background:var(--neon) !important; border-color:var(--neon) !important;
+        box-shadow:0 0 18px rgba(61,255,160,.45); }}
+    .stTabs [aria-selected="true"] p {{ color:#03110d !important; font-weight:800 !important; }}
+    .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {{ display:none !important; }}
 
-    /* ── CAMPI DA COMPILARE: sfondo bianco, testo scuro ── */
+    /* ── RIQUADRI, MODULI, TABELLE ── */
+    [data-testid="stForm"] {{ background:var(--vetro) !important; border:1px solid var(--bordo) !important;
+        border-radius:18px !important; backdrop-filter:blur(8px); }}
+    [data-testid="stExpander"] details {{ background:var(--vetro2) !important; border:1px solid var(--bordo) !important;
+        border-radius:14px !important; }}
+    [data-testid="stExpander"] summary p {{ font-weight:700 !important; }}
+    [data-testid="stAlert"] {{ background:rgba(46,230,255,.08) !important; border:1px solid rgba(46,230,255,.3) !important;
+        border-radius:14px !important; }}
+    [data-testid="stDataFrame"] {{ border:1px solid var(--bordo); border-radius:14px; overflow:hidden;
+        box-shadow:0 0 0 1px rgba(46,230,255,.05) inset; }}
+
+    /* ── CAMPI DA COMPILARE: chiari e leggibili, bordo neon quando li usi ── */
     .stApp input, .stApp textarea,
     [data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"],
-    [data-baseweb="select"] > div, [data-testid="stNumberInput"] button {{
-        background:#ffffff !important; color:#0b3d2e !important;
-        -webkit-text-fill-color:#0b3d2e !important; caret-color:#0b3d2e !important;
-        border-color:#d4af37 !important;
+    .stApp [data-baseweb="select"] > div, [data-testid="stNumberInput"] button {{
+        background:#e9fff4 !important; color:#03110d !important; -webkit-text-fill-color:#03110d !important;
+        caret-color:#03110d !important; border-color:transparent !important; border-radius:10px !important;
+        font-family:var(--f-testo) !important; font-weight:600 !important; font-size:16px !important;
+    }}
+    [data-baseweb="input"]:focus-within, [data-baseweb="textarea"]:focus-within,
+    .stApp [data-baseweb="select"] > div:focus-within {{
+        border:2px solid var(--neon) !important; box-shadow:0 0 0 4px rgba(61,255,160,.18) !important;
     }}
     .stApp [data-baseweb="select"] *, .stApp [data-testid="stNumberInput"] button *,
-    .stApp [data-baseweb="input"] *, .stApp [data-baseweb="base-input"] *,
-    .stApp [data-baseweb="tag"] * {{
-        color:#0b3d2e !important; -webkit-text-fill-color:#0b3d2e !important; fill:#0b3d2e !important;
+    .stApp [data-baseweb="input"] *, .stApp [data-baseweb="base-input"] *, .stApp [data-baseweb="tag"] * {{
+        color:#03110d !important; -webkit-text-fill-color:#03110d !important; fill:#03110d !important;
     }}
-    .stApp [data-baseweb="tag"] {{ background:#f3e7b8 !important; }}
+    .stApp [data-baseweb="tag"] {{ background:#b9ffd9 !important; }}
     .stApp input::placeholder, .stApp textarea::placeholder {{
-        color:#7a8a83 !important; -webkit-text-fill-color:#7a8a83 !important;
+        color:#6b8a7c !important; -webkit-text-fill-color:#6b8a7c !important;
     }}
     [data-baseweb="popover"], [data-baseweb="menu"], [role="listbox"], [data-baseweb="calendar"] {{
-        background:#ffffff !important;
+        background:#e9fff4 !important;
     }}
     [data-baseweb="popover"] *, [role="option"], [role="option"] *,
     .stApp [data-baseweb="popover"] *, .stApp [role="option"] * {{
-        color:#0b3d2e !important; -webkit-text-fill-color:#0b3d2e !important;
+        color:#03110d !important; -webkit-text-fill-color:#03110d !important;
     }}
-    [role="option"]:hover, [aria-selected="true"][role="option"] {{ background:#e8f3ec !important; }}
-    /* checkbox e radio leggibili */
-    .stApp [data-testid="stCheckbox"] label span, .stApp [data-testid="stRadio"] label span {{
-        border-color:var(--oro) !important;
-    }}
+    [role="option"]:hover, [aria-selected="true"][role="option"] {{ background:#b9ffd9 !important; }}
+    /* scelte a pallino (radio) dentro le pagine: diventano "pillole" */
+    [data-testid="stMain"] [role="radiogroup"], .main [role="radiogroup"] {{ gap:8px; flex-wrap:wrap; }}
+    [data-testid="stMain"] [role="radiogroup"] label, .main [role="radiogroup"] label {{ border:1px solid var(--bordo); border-radius:30px; padding:6px 14px 6px 10px;
+        background:var(--vetro2); margin:0 !important; }}
+    [data-testid="stMain"] [role="radiogroup"] label:has(input:checked),
+    .main [role="radiogroup"] label:has(input:checked) {{ border-color:var(--ciano);
+        box-shadow:0 0 14px rgba(46,230,255,.35) inset; }}
+    [data-testid="stMain"] [role="radiogroup"] label:has(input:checked) p,
+    .main [role="radiogroup"] label:has(input:checked) p {{ color:var(--ciano) !important; font-weight:700 !important; }}
 
     /* ── PULSANTI ── */
     .stButton button, [data-testid="stFormSubmitButton"] button, [data-testid="stDownloadButton"] button {{
-        background:var(--oro) !important; border:none !important; font-weight:800 !important;
-        border-radius:10px !important; transition:filter .15s;
+        background:linear-gradient(90deg, var(--neon), #9dffcf) !important; border:none !important;
+        border-radius:12px !important; box-shadow:0 0 18px rgba(61,255,160,.35); transition:filter .15s, box-shadow .15s;
     }}
     .stButton button:hover, [data-testid="stFormSubmitButton"] button:hover,
-    [data-testid="stDownloadButton"] button:hover {{ filter:brightness(1.1); }}
+    [data-testid="stDownloadButton"] button:hover {{ filter:brightness(1.08); box-shadow:0 0 28px rgba(61,255,160,.55); }}
     .stApp .stButton button *, .stApp [data-testid="stFormSubmitButton"] button *,
-    .stApp [data-testid="stDownloadButton"] button * {{ color:#0b3d2e !important; }}
+    .stApp [data-testid="stDownloadButton"] button * {{ color:#03110d !important; font-weight:800 !important; }}
+    [data-testid="stSidebar"] .stButton button {{ background:var(--vetro2) !important; border:1px solid var(--bordo) !important;
+        box-shadow:none; }}
+    [data-testid="stSidebar"] .stButton button * {{ color:var(--testo) !important; }}
 
     /* ── TELEFONO ── */
-    @media (max-width: 640px) {{
-        .banner {{ padding:18px; }} .banner .t {{ font-size:23px; }}
+    @media (max-width: 760px) {{
+        .banner {{ padding:18px; }} .banner .t {{ font-size:22px; }}
+        .banner .dx {{ position:static; text-align:left; margin-top:12px; }}
         .banner:before, .banner:after {{ display:none; }}
-        .kpi .v {{ font-size:20px; }}
+        .kpi .v {{ font-size:20px; }} .campo-neon {{ opacity:.35; }}
     }}
     </style>
+    {CAMPO_SVG}
     """, unsafe_allow_html=True)
 
 
@@ -659,18 +766,29 @@ def stemma():
     parole = [p for p in nome.replace(".", " ").split() if p[:1].isalpha()]
     sigla = "".join(p[0] for p in parole[:3]).upper() or "⚽"
     citta = escape(impostazione("citta", ""))
-    nome = escape(nome)
-    st.markdown(f"""<div class="stemma"><div class="scudo"><span>{sigla}</span></div>
-        <div><div class="nome">{nome}</div><div class="citta">{citta}</div></div></div>""",
+    img = _stemma_file()
+    logo = (f'<img src="{img}" alt="stemma">' if img else
+            f'<div class="scudo"><div class="b"></div><div class="s"></div><span>{escape(sigla)}</span></div>')
+    st.markdown(f"""<div class="stemma">{logo}
+        <div><div class="nome">{escape(nome)}</div><div class="citta">{citta}</div></div></div>""",
                 unsafe_allow_html=True)
+
+
+SOPRATITOLI = {"Panoramica": "Matchday finanziario", "Rosa & Staff": "La squadra",
+               "Cassa & Pagamenti": "Registro unico", "Fornitori & Fatture": "Da pagare",
+               "Sponsor": "Partner", "Scadenze": "Calendario", "Impostazioni": "Configurazione"}
 
 
 def banner(titolo, sottotitolo=""):
     nome = escape(impostazione("nome_squadra", "La mia squadra"))
-    stg = st.session_state.get("stagione", "")
-    st.markdown(f"""<div class="banner"><div class="t">{ICONE.get(titolo, '⚽')} {titolo}</div>
-        <div class="s">{nome}{' · ' + sottotitolo if sottotitolo else ''}</div>
-        <span class="badge">Stagione {stg}</span></div>""", unsafe_allow_html=True)
+    stg = escape(st.session_state.get("stagione", ""))
+    ora = datetime.now(TZ).strftime("%H:%M")
+    st.markdown(f"""<div class="banner">
+        <div class="k">● {SOPRATITOLI.get(titolo, nome)}</div>
+        <div class="t">{escape(titolo)}</div>
+        <div class="s">{nome}{' · ' + escape(sottotitolo) if sottotitolo else ''}</div>
+        <div class="dx"><span class="chip">STAGIONE {stg}</span>
+        <div class="live"><i></i>aggiornato alle {ora}</div></div></div>""", unsafe_allow_html=True)
 
 
 def kpi(col, label, valore, nota="", tono=""):
@@ -679,11 +797,24 @@ def kpi(col, label, valore, nota="", tono=""):
                  unsafe_allow_html=True)
 
 
+def kpi_score(col, entrate, uscite):
+    """Tabellone 'Entrate VS Uscite' come il risultato di una partita."""
+    num = lambda x: euro(x).replace("€ ", "").rsplit(",", 1)[0]
+    col.markdown(f"""<div class="kpi score">
+        <div class="t"><div class="l">Entrate</div><div class="v" style="color:{NEON};
+            text-shadow:0 0 12px rgba(61,255,160,.5)">{num(entrate)}</div></div>
+        <div class="vs">VS</div>
+        <div class="t"><div class="l">Uscite</div><div class="v" style="color:{ROSSO};
+            text-shadow:0 0 12px rgba(255,93,115,.45)">{num(uscite)}</div></div></div>""",
+                 unsafe_allow_html=True)
+
+
 def grafico_tema(ch):
-    return (ch.configure(background="transparent")
-            .configure_axis(labelColor="#f5f5f0", titleColor="#f5f5f0",
-                            gridColor="rgba(255,255,255,.12)", domainColor="#f5f5f0")
-            .configure_legend(labelColor="#f5f5f0", titleColor="#f5f5f0")
+    return (ch.configure(background="transparent", font="Rajdhani")
+            .configure_axis(labelColor=TENUE, titleColor=TENUE, gridColor="rgba(233,255,244,.07)",
+                            domainColor="rgba(233,255,244,.18)", tickColor="rgba(233,255,244,.18)",
+                            labelFontSize=12, titleFontSize=12)
+            .configure_legend(labelColor=TESTO, titleColor=TESTO, labelFontSize=13, symbolType="square")
             .configure_view(strokeWidth=0))
 
 
@@ -945,47 +1076,49 @@ def pagina_panoramica():
                        if len(sp) else 0)
     previsione = saldo - residuo_t - fatt_aperte + sp_da_incassare
 
-    c = st.columns(4)
-    kpi(c[0], "Entrate stagione", euro(entrate), "", "pos")
-    kpi(c[1], "Uscite stagione", euro(uscite), "", "neg")
-    kpi(c[2], "Saldo cassa", euro(saldo), f"di cui contanti {euro(contanti)}",
+    extra_soc = t["spese_extra"].sum() if len(t) else 0
+    c = st.columns([1.25, 1, 1, 1])
+    kpi_score(c[0], entrate, uscite)
+    kpi(c[1], "Saldo cassa", euro(saldo), f"di cui contanti {euro(contanti)}",
         "pos" if saldo >= 0 else "neg")
-    kpi(c[3], "Previsione fine stagione", euro(previsione),
-        "saldo − da pagare + sponsor da incassare", "gold")
+    kpi(c[2], "Da pagare a tesserati", euro(residuo_t), f"{len(t)} tesserati · residuo contratti", "neg")
+    kpi(c[3], "Previsione fine stagione", euro(previsione), "saldo − da pagare + sponsor", "gold")
     st.write("")
     c = st.columns(4)
-    kpi(c[0], "Da pagare a tesserati", euro(residuo_t), f"{len(t)} tesserati")
+    kpi(c[0], "Sponsor da incassare", euro(sp_da_incassare), f"{len(sp)} sponsor", "ciano")
     kpi(c[1], "Fatture da pagare", euro(fatt_aperte),
-        f"{(f['stato'] != 'Pagata').sum() if len(f) else 0} aperte")
-    kpi(c[2], "Sponsor da incassare", euro(sp_da_incassare), f"{len(sp)} sponsor")
-    kpi(c[3], "Rosa", f"{giocatori} giocatori", f"{len(t) - giocatori} staff")
+        f"{(f['stato'] != 'Pagata').sum() if len(f) else 0} aperte", "neg")
+    kpi(c[2], "Spese extra società", euro(extra_soc), "strutture fuori compenso", "gold")
+    kpi(c[3], "Rosa", f"{giocatori} {'giocatore' if giocatori == 1 else 'giocatori'}",
+        f"{len(t) - giocatori} staff")
 
     st.write("")
     g1, g2 = st.columns([1.3, 1])
     with g1:
-        st.subheader("Entrate e uscite per mese")
+        st.markdown("#### Entrate e uscite per mese")
         if len(m):
             m["d"] = m["data"].apply(parse_date)
             m = m.dropna(subset=["d"])
-            m["mese"] = m["d"].apply(lambda d: f"{d.year}-{d.month:02d}")
-            agg = m.groupby(["mese", "tipo"])["importo"].sum().reset_index()
-            ch = alt.Chart(agg).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
-                x=alt.X("mese:N", title=None), xOffset="tipo:N",
-                y=alt.Y("importo:Q", title="€"),
-                color=alt.Color("tipo:N", scale=alt.Scale(domain=["Entrata", "Uscita"],
-                                                          range=["#7CFC9A", "#ff8a80"]),
+            m["ord"] = m["d"].apply(lambda d: f"{d.year}-{d.month:02d}")
+            m["mese"] = m["d"].apply(lambda d: f"{MESI[d.month - 1][:3].upper()} {str(d.year)[2:]}")
+            agg = m.groupby(["ord", "mese", "tipo"])["importo"].sum().reset_index().sort_values("ord")
+            ch = alt.Chart(agg).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6, size=18).encode(
+                x=alt.X("mese:N", title=None, sort=agg["mese"].unique().tolist(), axis=alt.Axis(labelAngle=0)),
+                xOffset="tipo:N",
+                y=alt.Y("importo:Q", title=None),
+                color=alt.Color("tipo:N", scale=alt.Scale(domain=["Entrata", "Uscita"], range=[NEON, ROSSO]),
                                 legend=alt.Legend(orient="top", title=None)),
                 tooltip=["mese", "tipo", alt.Tooltip("importo:Q", format=",.2f")])
             st.altair_chart(grafico_tema(ch.properties(height=300)), width="stretch")
         else:
             st.caption("Nessun movimento ancora registrato.")
     with g2:
-        st.subheader("Dove vanno i soldi")
+        st.markdown("#### Dove vanno i soldi")
         u = m[m["tipo"] == "Uscita"] if len(m) else m
         if len(u):
             agg = u.groupby("categoria")["importo"].sum().sort_values(ascending=False)
             agg = agg.head(8).reset_index()
-            ch = alt.Chart(agg).mark_bar(color="#d4af37", cornerRadiusEnd=4).encode(
+            ch = alt.Chart(agg).mark_bar(color=ORO, cornerRadiusEnd=6, size=14).encode(
                 y=alt.Y("categoria:N", sort="-x", title=None),
                 x=alt.X("importo:Q", title="€"),
                 tooltip=["categoria", alt.Tooltip("importo:Q", format=",.2f")])
@@ -997,7 +1130,7 @@ def pagina_panoramica():
 
 
 def sezione_scadenze_prossime(sc):
-    st.subheader("📅 Scadenze nei prossimi 30 giorni")
+    st.markdown("#### Scadenze nei prossimi 30 giorni")
     if sc.empty:
         st.caption("Nessuna scadenza inserita.")
         return
@@ -1011,11 +1144,12 @@ def sezione_scadenze_prossime(sc):
     mt = mappa_tesserati()
     for _, r in sc.iterrows():
         scaduta = r["d"] < oggi()
-        col = "#ff8a80" if scaduta else "#d4af37"
+        vicina = r["d"] <= oggi() + timedelta(days=7)
+        col = ROSSO if scaduta else (ORO if vicina else NEON)
         chi = f" · {escape(mt.get(r['tesserato_id'], ''))}" if r["tesserato_id"] else ""
-        st.markdown(f"<span class='pill' style='background:{col};color:#0b3d2e'>"
-                    f"{'SCADUTA' if scaduta else r['d'].strftime('%d/%m')}</span> "
-                    f"<b>{escape(r['tipo'])}</b> – {escape(r['descrizione'])}{chi}", unsafe_allow_html=True)
+        st.markdown(f"<div class='scad'><span class='pill' style='background:{col}'>"
+                    f"{'SCADUTA' if scaduta else r['d'].strftime('%d/%m')}</span>"
+                    f"<b>{escape(r['tipo'])}</b> {escape(r['descrizione'])}{chi}</div>", unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1688,7 +1822,7 @@ def sezione_totale_per_giocatore(t):
             x=alt.X("sum(Euro):Q", title="€", stack="zero"),
             color=alt.Color("Voce:N", scale=alt.Scale(
                 domain=["Pagato al giocatore", "Strutture nel compenso", "Extra fuori contratto"],
-                range=["#7CFC9A", "#d4af37", "#ff8a80"]), legend=alt.Legend(orient="top", title=None)),
+                range=[NEON, ORO, ROSSO]), legend=alt.Legend(orient="top", title=None)),
             tooltip=["Nominativo", "Voce", alt.Tooltip("Euro:Q", format=",.2f")])
         st.altair_chart(grafico_tema(ch.properties(height=max(220, 28 * len(graf)))), width="stretch")
     st.download_button("⬇️ Scarica totale per giocatore (Excel)", to_excel({"Totale per giocatore": out_tot}),
