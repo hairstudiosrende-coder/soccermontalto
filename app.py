@@ -1008,13 +1008,15 @@ def pagina_rosa():
                         "Età": "Età", "provenienza": "Provenienza", "stato": "Stato"}
                 if imp:
                     cols.update({"compenso_stagione": "Compenso", "extra": "Extra",
-                                 "totale": "Totale", "pagato": "Pagato", "residuo": "Residuo"})
+                                 "totale": "Totale", "pagato": "Pagato", "residuo": "Residuo",
+                                 "costo_totale": "Totale speso"})
                 st.markdown(f"#### {rep}  <span style='opacity:.6;font-size:14px'>({len(g)})</span>",
                             unsafe_allow_html=True)
                 st.dataframe(g[list(cols)].rename(columns=cols), hide_index=True,
                              width="stretch",
                              column_config={k: st.column_config.NumberColumn(format="€ %.2f")
-                                            for k in ["Compenso", "Extra", "Totale", "Pagato", "Residuo"]})
+                                            for k in ["Compenso", "Extra", "Totale", "Pagato", "Residuo",
+                                                      "Totale speso"]})
             if imp:
                 c = st.columns(3)
                 kpi(c[0], "Totale contratti", euro(v["totale"].sum()))
@@ -1044,14 +1046,18 @@ def pagina_rosa():
                                                  f"{t.set_index('id').loc[i, 'tipo']}")
         r = t[t["id"] == sel].iloc[0].to_dict()
         if imp:
-            c = st.columns(5)
+            st.markdown("#### 📑 Contratto")
+            c = st.columns(4)
             kpi(c[0], "Compenso", euro(r["compenso_stagione"]))
-            kpi(c[1], "Extra contratto", euro(r["extra"]))
-            kpi(c[2], "Pagato", euro(r["pagato"]),
-                f"di cui a strutture {euro(r['pagato_terzi'])}", "pos")
-            kpi(c[3], "Residuo", euro(r["residuo"]), tono="gold")
-            kpi(c[4], "Spese extra società", euro(r["spese_extra"]),
-                f"costo totale {euro(r['costo_totale'])}", "neg")
+            kpi(c[1], "Voci extra a contratto", euro(r["extra"]), "alloggio, vitto, premi… pattuiti")
+            kpi(c[2], "Totale contratto", euro(r["totale"]))
+            kpi(c[3], "Residuo da pagare", euro(r["residuo"]), "sul contratto", "gold")
+            st.markdown("#### 💸 Speso finora per lui")
+            c = st.columns(4)
+            kpi(c[0], "Pagato al giocatore", euro(r["pagato_diretto"]), "bonifico / contanti", "pos")
+            kpi(c[1], "Strutture nel compenso", euro(r["pagato_terzi"]), "scalati dal contratto", "pos")
+            kpi(c[2], "Extra fuori contratto", euro(r["spese_extra"]), "strutture a carico società", "neg")
+            kpi(c[3], "TOTALE SPESO", euro(r["costo_totale"]), "tutto ciò che è costato", "gold")
             st.write("")
 
         s1, s2, s3 = st.tabs(["✏️ Dati", "📑 Voci contratto", "💶 Pagamenti e spese"])
@@ -1108,7 +1114,26 @@ def pagina_rosa():
                         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
                 else:
                     st.caption("Solo compenso base. Aggiungi qui alloggio, vitto, volo, procura, premi…")
+                ex = spese_per_tesserati()
+                ex = ex[(ex["tesserato_id"] == sel) & (ex["nel_compenso"] != "SI")].copy()
+                st.markdown("#### ➕ Extra fuori contratto (pagati a strutture)")
+                if ex.empty:
+                    st.caption("Nessuna spesa extra: alloggi, visite o terapie pagate alle strutture "
+                               "con la scelta *NO – spesa extra* compariranno qui.")
+                else:
+                    ex["Data"] = ex["data"].apply(fmt_data)
+                    st.dataframe(ex[["Data", "beneficiario", "categoria", "descrizione", "importo"]].rename(
+                        columns={"beneficiario": "Struttura", "categoria": "Tipo",
+                                 "descrizione": "Descrizione", "importo": "Importo"}),
+                        hide_index=True, width="stretch",
+                        column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
+                c = st.columns(3)
+                kpi(c[0], "Totale contratto", euro(r["totale"]), "compenso + voci a contratto")
+                kpi(c[1], "Extra fuori contratto", euro(r["spese_extra"]), tono="neg")
+                kpi(c[2], "Contratto + extra", euro(r["totale"] + r["spese_extra"]), tono="gold")
+                st.write("")
                 if puo_modificare():
+                    st.markdown("##### Aggiungi voce a contratto")
                     with st.form(f"voce_{sel}", clear_on_submit=True):
                         c = st.columns([1.2, 1, 2])
                         voce = c[0].selectbox("Voce", [x for x in categorie("VOCE_CONTRATTO") if x != "Compenso"]
@@ -1156,7 +1181,18 @@ def pagina_rosa():
                                  "descrizione": "Descrizione", "importo": "Importo"}),
                         hide_index=True, width="stretch",
                         column_config={"Importo": st.column_config.NumberColumn(format="€ %.2f")})
+                    c = st.columns(3)
+                    kpi(c[0], "Strutture nel compenso", euro(sp[sp["nel_compenso"] == "SI"]["importo"].sum()),
+                        "scalati dal contratto", "pos")
+                    kpi(c[1], "Strutture extra", euro(sp[sp["nel_compenso"] != "SI"]["importo"].sum()),
+                        "fuori contratto", "neg")
+                    kpi(c[2], "Totale strutture", euro(sp["importo"].sum()), tono="gold")
                     st.caption("Per cambiare la scelta compenso: Pagamenti → 🏨 Pagati a strutture.")
+                st.markdown("#### 🧮 Totale speso per lui in questa stagione")
+                c = st.columns(3)
+                kpi(c[0], "Pagato al giocatore", euro(r["pagato_diretto"]), tono="pos")
+                kpi(c[1], "Pagato a strutture", euro(r["pagato_terzi"] + r["spese_extra"]))
+                kpi(c[2], "TOTALE SPESO", euro(r["costo_totale"]), tono="gold")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1172,8 +1208,8 @@ def pagina_pagamenti():
     nomi = t.set_index("id")["nominativo"].to_dict()
     mesi = mesi_stagione()
     mese_corr = f"{MESI[oggi().month - 1]} {oggi().year}"
-    tab1, tab_s, tab2, tab3, tab4 = st.tabs(["➕ Registra pagamento", "🏨 Pagati a strutture", "📊 Residui",
-                                             "🗓️ Elenco del mese", "📜 Storico"])
+    tab1, tab_s, tab2, tab_t, tab3, tab4 = st.tabs(["➕ Registra pagamento", "🏨 Pagati a strutture", "📊 Residui",
+                                                    "🧮 Totale per giocatore", "🗓️ Elenco del mese", "📜 Storico"])
 
     with tab1:
         if not blocca_se_sola_lettura():
@@ -1236,6 +1272,9 @@ def pagina_pagamenti():
         st.write("")
         st.download_button("⬇️ Scarica residui", to_excel({"Residui": v}), "residui.xlsx")
 
+    with tab_t:
+        sezione_totale_per_giocatore(t)
+
     with tab3:
         mese = st.selectbox("Mese", mesi, index=mesi.index(mese_corr) if mese_corr in mesi else 0,
                             key="elenco_mese")
@@ -1289,6 +1328,69 @@ def pagina_pagamenti():
                             elimina("Movimenti", mov)
                         elimina("Pagamenti", pid)
                         st.rerun()
+
+
+def sezione_totale_per_giocatore(t):
+    """Riepilogo di fine stagione: quanto è costato ogni tesserato, con dettaglio per tipo di spesa."""
+    st.caption(f"Tutto quello che la società ha speso per ogni tesserato nella stagione "
+               f"**{st.session_state['stagione']}**: soldi dati a lui + strutture (nel compenso ed extra).")
+    solo = st.radio("Mostra", ["Tutti", "Solo giocatori", "Solo staff"], horizontal=True, key="tot_solo")
+    v = t.copy()
+    if solo == "Solo giocatori":
+        v = v[v["tipo"] == "Giocatore"]
+    elif solo == "Solo staff":
+        v = v[v["tipo"] != "Giocatore"]
+    if v.empty:
+        st.caption("Nessun tesserato.")
+        return
+    # dettaglio strutture per tipo di spesa
+    sp = spese_per_tesserati()
+    det = (sp.pivot_table(index="tesserato_id", columns="categoria", values="importo",
+                          aggfunc="sum", fill_value=0.0) if len(sp) else pd.DataFrame())
+    out = v[["id", "nominativo", "tipo", "reparto", "totale", "pagato_diretto", "pagato_terzi",
+             "spese_extra", "costo_totale", "residuo"]].copy()
+    cat_cols = []
+    if len(det):
+        det.columns = [f"di cui {c}" for c in det.columns]
+        cat_cols = list(det.columns)
+        out = out.merge(det, left_on="id", right_index=True, how="left").fillna({c: 0.0 for c in cat_cols})
+    out = out.sort_values("costo_totale", ascending=False).drop(columns="id")
+    nomi_col = {"nominativo": "Nominativo", "tipo": "Tipo", "reparto": "Reparto",
+                "totale": "Totale contratto", "pagato_diretto": "Pagato al giocatore",
+                "pagato_terzi": "Strutture nel compenso", "spese_extra": "Extra fuori contratto",
+                "costo_totale": "TOTALE SPESO", "residuo": "Residuo da pagare"}
+    out = out.rename(columns=nomi_col)
+    num = [c for c in out.columns if c not in ("Nominativo", "Tipo", "Reparto")]
+    tot = {c: out[c].sum() for c in num}
+    tot.update({"Nominativo": "TOTALE", "Tipo": "", "Reparto": ""})
+    out_tot = pd.concat([out, pd.DataFrame([tot])], ignore_index=True)
+
+    c = st.columns(4)
+    kpi(c[0], "Totale speso", euro(tot["TOTALE SPESO"]), f"{len(out)} tesserati", "gold")
+    kpi(c[1], "Dato ai tesserati", euro(tot["Pagato al giocatore"]), tono="pos")
+    kpi(c[2], "Pagato a strutture", euro(tot["Strutture nel compenso"] + tot["Extra fuori contratto"]))
+    media = tot["TOTALE SPESO"] / len(out) if len(out) else 0
+    kpi(c[3], "Media per tesserato", euro(media))
+    st.write("")
+    st.dataframe(out_tot, hide_index=True, width="stretch",
+                 column_config={k: st.column_config.NumberColumn(format="€ %.2f") for k in num})
+
+    graf = out[out["TOTALE SPESO"] > 0].head(15)
+    if len(graf):
+        st.markdown("#### Chi è costato di più")
+        lunga = graf.melt(id_vars="Nominativo",
+                          value_vars=["Pagato al giocatore", "Strutture nel compenso", "Extra fuori contratto"],
+                          var_name="Voce", value_name="Euro")
+        ch = alt.Chart(lunga).mark_bar(cornerRadiusEnd=3).encode(
+            y=alt.Y("Nominativo:N", sort=graf["Nominativo"].tolist(), title=None),
+            x=alt.X("sum(Euro):Q", title="€", stack="zero"),
+            color=alt.Color("Voce:N", scale=alt.Scale(
+                domain=["Pagato al giocatore", "Strutture nel compenso", "Extra fuori contratto"],
+                range=["#7CFC9A", "#d4af37", "#ff8a80"]), legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Nominativo", "Voce", alt.Tooltip("Euro:Q", format=",.2f")])
+        st.altair_chart(grafico_tema(ch.properties(height=max(220, 28 * len(graf)))), width="stretch")
+    st.download_button("⬇️ Scarica totale per giocatore (Excel)", to_excel({"Totale per giocatore": out_tot}),
+                       f"totale_per_giocatore_{st.session_state['stagione'].replace('/', '-')}.xlsx")
 
 
 def sezione_pagati_strutture(t, nomi, mesi, mese_corr):
